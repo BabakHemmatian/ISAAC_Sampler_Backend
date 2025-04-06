@@ -1,0 +1,13 @@
+fastapi
+pandas
+random2
+uvicorn
+python-multipart
+nest_asyncio
+boto3
+aiosmtplib
+email-validator
+psycopg2-binary
+asyncpg
+python-dotenv
+supabase
