@@ -9,3 +9,4 @@ supabase
 aiosmtplib
 python-multipart
 pydantic
+email-validator
