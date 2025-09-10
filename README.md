@@ -6,6 +6,19 @@ This repository contains the backend scripts for [this website](https://isaac.ps
 
 ## Citation
 If you use this repository in your work, please cite us as follows:
+
+### APA Format
 ```
 Hemmatian, B., & Dhamdhere, S.S. (2025). ISAAC Sampler (Backend)[Computer software]. GitHub. [https://github.com/BabakHemmatian/ISAAC_Sampler_Backend/](https://github.com/BabakHemmatian/ISAAC_Sampler_Backend/)
+```
+### BibTex Format
+```
+@software{hemmatian2025isaac,
+  author       = {Hemmatian, Babak and Dhamdhere, S. S.},
+  title        = {ISAAC Sampler (Backend)},
+  year         = {2025},
+  url          = {https://github.com/BabakHemmatian/ISAAC_Sampler_Backend},
+  publisher    = {GitHub},
+  note         = {Computer software}
+}
 ```
