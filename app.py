@@ -36,18 +36,25 @@ load_dotenv()
 # CORS configuration - allow specific origins
 # When allow_credentials=True, you cannot use allow_origins=["*"]
 # Get allowed origins from environment variable or default to localhost:3000
-ALLOWED_ORIGINS = os.getenv(
+ALLOWED_ORIGINS_ENV = os.getenv(
     "ALLOWED_ORIGINS",
     "http://localhost:3000,http://localhost:3001"
-).split(",")
+)
+# Parse and clean origins, filtering out empty strings
+ALLOWED_ORIGINS = [
+    origin.strip() 
+    for origin in ALLOWED_ORIGINS_ENV.split(",") 
+    if origin.strip()
+]
 
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[origin.strip() for origin in ALLOWED_ORIGINS],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 SMTP_HOST = os.getenv("SMTP_HOST")
