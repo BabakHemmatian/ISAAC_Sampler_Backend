@@ -33,10 +33,18 @@ import s3fs
 
 load_dotenv()
 
+# CORS configuration - allow specific origins
+# When allow_credentials=True, you cannot use allow_origins=["*"]
+# Get allowed origins from environment variable or default to localhost:3000
+ALLOWED_ORIGINS = os.getenv(
+    "ALLOWED_ORIGINS",
+    "http://localhost:3000,http://localhost:3001"
+).split(",")
+
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[origin.strip() for origin in ALLOWED_ORIGINS],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
