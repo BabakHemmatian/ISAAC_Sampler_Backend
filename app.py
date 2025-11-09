@@ -21,6 +21,7 @@ import pandas as pd
 import numpy as np
 import asyncpg
 import boto3
+from boto3.s3.transfer import TransferConfig
 import aiosmtplib
 from email.message import EmailMessage
 from dotenv import load_dotenv
@@ -82,6 +83,9 @@ ASSUMED_UPLOAD_BPS = 10 * 1024 * 1024
 ZIP_PART_SIZE_ROWS = 100_000          
 DEFAULT_MAX_WORKERS = min(8, os.cpu_count() or 4)
 
+# Task cleanup configuration
+TASK_CLEANUP_MAX_AGE_SECONDS = int(os.getenv("TASK_CLEANUP_MAX_AGE_SECONDS", "86400"))  # 24 hours default
+
 def now() -> float:
     return time.time()
 
@@ -134,6 +138,25 @@ def _update_eta_from_units(task_id: str):
     eta = remaining_units * avg_per_unit
     _set_progress(task_id, eta_seconds=eta)
 
+def cleanup_old_tasks(max_age_seconds: int = TASK_CLEANUP_MAX_AGE_SECONDS):
+    """Remove tasks older than max_age_seconds to prevent memory leaks."""
+    current_time = now()
+    with _progress_lock:
+        tasks_to_remove = []
+        for task_id, meta in task_meta.items():
+            start_time = meta.get("start_time", 0)
+            if current_time - start_time > max_age_seconds:
+                tasks_to_remove.append(task_id)
+        
+        for task_id in tasks_to_remove:
+            task_progress.pop(task_id, None)
+            task_stage.pop(task_id, None)
+            task_results.pop(task_id, None)
+            task_meta.pop(task_id, None)
+        
+        if tasks_to_remove:
+            print(f"[INFO] Cleaned up {len(tasks_to_remove)} old task(s)", file=sys.stderr)
+
 
 class IssueReport(BaseModel):
     email: EmailStr
@@ -163,8 +186,6 @@ READ_CSV_KW = dict(
 
 
 async def fetch_metadata(social_group: str, start_month: str, end_month: str):
-    import sys
-    print(f"[DEBUG] SUPABASE_DB_URL: {SUPABASE_DB_URL}", file=sys.stderr)
     conn = await asyncpg.connect(SUPABASE_DB_URL)
     try:
         query = """
@@ -175,7 +196,6 @@ async def fetch_metadata(social_group: str, start_month: str, end_month: str):
           AND date <  (($3 || '-01')::date + INTERVAL '1 MONTH')
         ORDER BY date ASC;
         """
-        print(f"[DEBUG] Running metadata query for group={social_group}, start={start_month}, end={end_month}", file=sys.stderr)
         async with conn.transaction():
             async for record in conn.cursor(query, social_group, start_month, end_month):
                 yield {"file_path": record["file_path"], "num_rows": record["num_rows"]}
@@ -227,12 +247,38 @@ def stream_object_to_zip(zipf: zipfile.ZipFile, key: str, arcname: Optional[str]
         return False
 
 def upload_file_and_get_presigned(local_path: str, dest_key: str, expires_in: int = 3600) -> str:
-    s3_client.upload_file(local_path, SUPABASE_BUCKET_NAME, dest_key)
-    return s3_client.generate_presigned_url(
+    # Use TransferConfig with single-threaded upload to avoid multipart ordering issues
+    # This ensures parts are uploaded in order and prevents "parts not in ascending order" errors
+    transfer_config = TransferConfig(
+        multipart_threshold=1024 * 1024 * 5,  # 5MB threshold for multipart
+        max_concurrency=1,  # Single thread to ensure part ordering
+        use_threads=True,  # Use threads but with max_concurrency=1 to ensure sequential part uploads
+        multipart_chunksize=1024 * 1024 * 8,  # 8MB chunks
+    )
+    s3_client.upload_file(
+        local_path, 
+        SUPABASE_BUCKET_NAME, 
+        dest_key,
+        Config=transfer_config
+    )
+    
+    # Generate presigned URL
+    presigned = s3_client.generate_presigned_url(
         "get_object",
         Params={"Bucket": SUPABASE_BUCKET_NAME, "Key": dest_key},
         ExpiresIn=expires_in
     )
+    
+    # Clean up local file after successful upload
+    try:
+        if os.path.exists(local_path):
+            os.remove(local_path)
+            print(f"[INFO] Cleaned up local file after upload: {local_path}", file=sys.stderr)
+    except Exception as e:
+        print(f"[WARNING] Failed to cleanup local file {local_path}: {e}", file=sys.stderr)
+        # Don't fail the upload if cleanup fails
+    
+    return presigned
 
 
 def sample_csv_reservoir_from_s3(key: str, k: int, chunksize: int = 200_000) -> pd.DataFrame:
@@ -243,8 +289,8 @@ def sample_csv_reservoir_from_s3(key: str, k: int, chunksize: int = 200_000) -> 
     reservoir = None
     seen = 0
 
-    with s3_open_csv_stream(key) as stream:
-        for chunk in pd.read_csv(stream, chunksize=chunksize, **READ_CSV_KW):
+    with s3_open_csv_stream(key) as csv_stream:
+        for chunk in pd.read_csv(csv_stream, chunksize=chunksize, **READ_CSV_KW):
             if reservoir is None:
                 take = min(k, len(chunk))
                 if take == 0:
@@ -276,26 +322,14 @@ def sample_parquet_reservoir_from_s3(
     if k <= 0:
         return pd.DataFrame()
 
-    def _norm_month(s):
-        if s and len(s) == 7: 
-            return s + "-01T00:00:00"
-        return s
-    
-    def _norm_month_end(s):
-        if s and len(s) == 7:
-            year, month = s.split("-")
-            import calendar
-            last_day = calendar.monthrange(int(year), int(month))[1]
-            return f"{s}-{last_day:02d}T23:59:59"
-        return s
-
+    # Use module-level helper functions (no duplicates)
     start_ts = _norm_month(start_ts)
     end_ts   = _norm_month_end(end_ts)
 
     path = f"{SUPABASE_BUCKET_NAME}/{key}" if not key.startswith(f"{SUPABASE_BUCKET_NAME}/") else key
 
-    with s3_fs.open(path, "rb") as f:
-        pf = pq.ParquetFile(f)
+    with s3_fs.open(path, "rb") as parquet_file:
+        pf = pq.ParquetFile(parquet_file)
 
         rg_indices = []
         time_idx = None
@@ -402,45 +436,93 @@ def compute_per_file_quotas(files: List[Dict], num_docs: int) -> List[int]:
     return quotas
 
 def _norm_month(s):
+    """Normalize month string (YYYY-MM) to datetime format (YYYY-MM-01T00:00:00)."""
     if s and len(s) == 7: 
         return s + "-01T00:00:00"
     return s
 
 def _norm_month_end(s):
+    """Normalize month string (YYYY-MM) to end of month datetime format."""
     if s and len(s) == 7:
-        year, month = s.split("-")
-        import calendar
-        last_day = calendar.monthrange(int(year), int(month))[1]
-        return f"{s}-{last_day:02d}T23:59:59"
+        try:
+            parts = s.split("-")
+            if len(parts) != 2:
+                return s
+            year, month = parts
+            import calendar
+            last_day = calendar.monthrange(int(year), int(month))[1]
+            return f"{s}-{last_day:02d}T23:59:59"
+        except (ValueError, IndexError, calendar.IllegalMonthError):
+            # If parsing fails, return original string
+            return s
     return s
 
 def convert_parquet_to_csv_and_zip(zipf: zipfile.ZipFile, key: str, arcname: str, 
                                    start_date: str, end_date: str) -> bool:
+    """
+    Convert parquet to CSV using row group streaming for memory efficiency.
+    Processes parquet file in chunks (row groups) to avoid loading entire file into memory.
+    """
     try:
         path = f"{SUPABASE_BUCKET_NAME}/{key}" if not key.startswith(f"{SUPABASE_BUCKET_NAME}/") else key
         
-        with s3_fs.open(path, "rb") as f:
-            pf = pq.ParquetFile(f)
-            table = pf.read()
-            df = table.to_pandas()
+        csv_name = arcname.replace('.parquet', '.csv').replace('.parq', '.csv')
+        
+        with s3_fs.open(path, "rb") as parquet_file:
+            pf = pq.ParquetFile(parquet_file)
             
-            if df.empty:
-                return False
-
-            csv_name = arcname.replace('.parquet', '.csv').replace('.parq', '.csv')
+            # Check if file has row groups
+            num_row_groups = pf.metadata.num_row_groups if pf.metadata else 0
             
-            from io import StringIO
-            csv_buffer = StringIO()
-            df.to_csv(csv_buffer, index=False)
-            csv_content = csv_buffer.getvalue()
+            if num_row_groups == 0:
+                # Fallback: read entire file if no row groups
+                table = pf.read()
+                df = table.to_pandas()
+                if df.empty:
+                    return False
+                
+                from io import StringIO
+                csv_buffer = StringIO()
+                df.to_csv(csv_buffer, index=False)
+                csv_content = csv_buffer.getvalue()
+                
+                with zipf.open(csv_name, "w") as zf:
+                    zf.write(csv_content.encode('utf-8'))
+                return True
             
+            # Stream row groups for memory efficiency
             with zipf.open(csv_name, "w") as zf:
-                zf.write(csv_content.encode('utf-8'))
+                first_row_group = True
+                
+                for i in range(num_row_groups):
+                    # Read one row group at a time
+                    table = pf.read_row_group(i)
+                    df = table.to_pandas()
+                    
+                    if df.empty:
+                        continue
+                    
+                    # Write CSV header only for first row group
+                    from io import StringIO
+                    csv_buffer = StringIO()
+                    df.to_csv(csv_buffer, index=False, header=first_row_group)
+                    csv_content = csv_buffer.getvalue()
+                    
+                    # For subsequent row groups, skip header line
+                    if not first_row_group:
+                        # Remove header line from subsequent chunks
+                        lines = csv_content.split('\n')
+                        if len(lines) > 1:
+                            csv_content = '\n'.join(lines[1:])
+                    
+                    zf.write(csv_content.encode('utf-8'))
+                    first_row_group = False
             
             return True
             
     except Exception as e:
         print(f"[ERROR] Failed to convert parquet {key}: {e}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
         return False
 
 def process_file_fast(zipf: zipfile.ZipFile, file_info: Dict, start_date: str, end_date: str) -> bool:
@@ -448,14 +530,11 @@ def process_file_fast(zipf: zipfile.ZipFile, file_info: Dict, start_date: str, e
     arcname = os.path.basename(key)
     
     try:
-        print(f"[DEBUG] Processing file: {key}", file=sys.stderr)
         if key.lower().endswith(('.parquet', '.parq')):
-            print(f"[DEBUG] Converting parquet to CSV: {key}", file=sys.stderr)
             return convert_parquet_to_csv_and_zip(zipf, key, arcname, start_date, end_date)
         else:
             if not arcname.lower().endswith('.csv'):
                 arcname = arcname.rsplit('.', 1)[0] + '.csv'
-            print(f"[DEBUG] Streaming CSV: {key} -> {arcname}", file=sys.stderr)
             return stream_object_to_zip(zipf, key, arcname)
     except Exception as e:
         print(f"[ERROR] Failed to process file {key}: {e}", file=sys.stderr)
@@ -465,7 +544,11 @@ def process_file_fast(zipf: zipfile.ZipFile, file_info: Dict, start_date: str, e
 
 def zip_originals_from_s3(task_id: str, files: List[Dict], social_group: str,
                           start_date: str, end_date: str) -> str:
-    _set_progress(task_id, stage="Bundling original files (optimized)")
+    """
+    Process files in parallel using ThreadPoolExecutor for better performance.
+    Parquet files are converted to CSV using streaming row groups for memory efficiency.
+    """
+    _set_progress(task_id, stage="Bundling original files (parallelized)")
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
     zip_filename = f"ISSAC_{social_group}_{start_date}_{end_date}_{timestamp}.zip"
     zip_path = os.path.join(TEMP_DIR, zip_filename)
@@ -473,24 +556,115 @@ def zip_originals_from_s3(task_id: str, files: List[Dict], social_group: str,
     total_files = len(files)
     _set_progress(task_id, total_units=total_files + 1, completed_units=0)
 
+    # Use a lock for thread-safe zip file operations
+    zip_lock = threading.Lock()
+    completed = 0
+    successful = 0
+    
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zipf:
-        completed = 0
-        successful = 0
-        
-        for f in files:
+        def process_file_with_lock(file_info: Dict) -> bool:
+            """Process a single file and update progress in thread-safe manner."""
+            nonlocal completed, successful
             try:
-                success = process_file_fast(zipf, f, start_date, end_date)
-                if success:
-                    successful += 1
+                # Process the file (parquet conversion happens outside lock)
+                key = file_info["file_path"]
+                arcname = os.path.basename(key)
+                
+                if key.lower().endswith(('.parquet', '.parq')):
+                    # Convert parquet to CSV in memory, then add to zip
+                    csv_name = arcname.replace('.parquet', '.csv').replace('.parq', '.csv')
+                    path = f"{SUPABASE_BUCKET_NAME}/{key}" if not key.startswith(f"{SUPABASE_BUCKET_NAME}/") else key
+                    
+                    try:
+                        with s3_fs.open(path, "rb") as parquet_file:
+                            pf = pq.ParquetFile(parquet_file)
+                            num_row_groups = pf.metadata.num_row_groups if pf.metadata else 0
+                            
+                            if num_row_groups == 0:
+                                # Fallback: read entire file
+                                table = pf.read()
+                                df = table.to_pandas()
+                                if df.empty:
+                                    return False
+                                
+                                from io import StringIO
+                                csv_buffer = StringIO()
+                                df.to_csv(csv_buffer, index=False)
+                                csv_content = csv_buffer.getvalue().encode('utf-8')
+                                
+                                # Add to zip file (thread-safe operation)
+                                with zip_lock:
+                                    with zipf.open(csv_name, "w") as zf:
+                                        zf.write(csv_content)
+                                return True
+                            
+                            # Stream row groups for memory efficiency
+                            csv_chunks = []
+                            first_row_group = True
+                            
+                            for i in range(num_row_groups):
+                                table = pf.read_row_group(i)
+                                df = table.to_pandas()
+                                
+                                if df.empty:
+                                    continue
+                                
+                                from io import StringIO
+                                csv_buffer = StringIO()
+                                df.to_csv(csv_buffer, index=False, header=first_row_group)
+                                csv_content = csv_buffer.getvalue()
+                                
+                                # For subsequent row groups, skip header line
+                                if not first_row_group:
+                                    lines = csv_content.split('\n')
+                                    if len(lines) > 1:
+                                        csv_content = '\n'.join(lines[1:])
+                                
+                                csv_chunks.append(csv_content.encode('utf-8'))
+                                first_row_group = False
+                        
+                        # Add to zip file (thread-safe operation)
+                        with zip_lock:
+                            with zipf.open(csv_name, "w") as zf:
+                                for chunk in csv_chunks:
+                                    zf.write(chunk)
+                        
+                        return True
+                    except Exception as e:
+                        print(f"[ERROR] Failed to convert parquet {key}: {e}", file=sys.stderr)
+                        traceback.print_exc(file=sys.stderr)
+                        return False
+                else:
+                    # CSV files - stream directly
+                    with zip_lock:
+                        return stream_object_to_zip(zipf, key, arcname)
+                        
             except Exception as e:
-                print(f"[ERROR] File processing failed for {f['file_path']}: {e}", file=sys.stderr)
+                print(f"[ERROR] File processing failed for {file_info.get('file_path', 'unknown')}: {e}", file=sys.stderr)
+                traceback.print_exc(file=sys.stderr)
+                return False
+            finally:
+                # Update progress thread-safely
+                with zip_lock:
+                    completed += 1
+                    _set_progress(task_id, completed_units=completed)
+                    _update_eta_from_units(task_id)
+                    
+                    if completed % max(1, total_files // 10) == 0:
+                        _set_progress(task_id, stage=f"Processed {completed}/{total_files} files ({successful} successful)")
+        
+        # Process files in parallel using ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=DEFAULT_MAX_WORKERS) as executor:
+            futures = [executor.submit(process_file_with_lock, f) for f in files]
             
-            completed += 1
-            _set_progress(task_id, completed_units=completed)
-            _update_eta_from_units(task_id)
-            
-            if completed % max(1, total_files // 10) == 0:
-                _set_progress(task_id, stage=f"Processed {completed}/{total_files} files ({successful} successful)")
+            for fut in as_completed(futures):
+                try:
+                    result = fut.result()
+                    if result:
+                        with zip_lock:
+                            successful += 1
+                except Exception as e:
+                    print(f"[ERROR] Future failed: {e}", file=sys.stderr)
 
     _set_progress(task_id, stage="Uploading to Supabase Storage")
     object_name = f"samples/{zip_filename}"
@@ -503,13 +677,14 @@ def zip_originals_from_s3(task_id: str, files: List[Dict], social_group: str,
 
     _set_progress(task_id, completed_units=total_files + 1, eta_seconds=0)
     print(f"[INFO] Fast path completed: {successful}/{total_files} files processed successfully", file=sys.stderr)
+    
+    # Clean up old tasks after successful completion
+    cleanup_old_tasks()
+    
     return presigned
 
 def background_sampling(task_id: str, social_group: str, start_date: str,
                         end_date: str, num_docs: Optional[int] = None):
-    import sys
-    print(f"[DEBUG] Starting background_sampling for group={social_group}, start={start_date}, end={end_date}, num_docs={num_docs}", file=sys.stderr)
-    print(f"[DEBUG] num_docs type: {type(num_docs)}, value: {repr(num_docs)}", file=sys.stderr)
     try:
         max_tries = int(os.getenv("DB_RETRIES", "3"))
         overall_timeout = int(os.getenv("DB_OVERALL_TIMEOUT", "300"))
@@ -602,6 +777,9 @@ def background_sampling(task_id: str, social_group: str, start_date: str,
         _set_progress(task_id, completed_units=completed_units, eta_seconds=0)
         task_results[task_id] = presigned
         _set_progress(task_id, stage="Done", eta_seconds=0)
+        
+        # Clean up old tasks after successful completion
+        cleanup_old_tasks()
 
     except Exception as e:
         print(f"[ERROR] background_sampling crashed: {repr(e)}")
@@ -673,11 +851,38 @@ async def get_sampled_data(payload: dict, background_tasks: BackgroundTasks):
     if not social_group or not start_date or not end_date:
         raise HTTPException(status_code=400, detail="Missing required fields")
 
-    if int(start_date.split("-")[0]) < 2007 or int(end_date.split("-")[0]) > 2023:
-        raise HTTPException(status_code=400, detail="Date range must be between 2007 and 2023")
+    # Validate date format and range
+    try:
+        start_parts = start_date.split("-")
+        end_parts = end_date.split("-")
+        if len(start_parts) < 2 or len(end_parts) < 2:
+            raise HTTPException(status_code=400, detail="Invalid date format. Expected YYYY-MM")
+        
+        start_year = int(start_parts[0])
+        end_year = int(end_parts[0])
+        
+        if start_year < 2007 or end_year > 2023:
+            raise HTTPException(status_code=400, detail="Date range must be between 2007 and 2023")
+    except (ValueError, IndexError) as e:
+        raise HTTPException(status_code=400, detail=f"Invalid date format. Expected YYYY-MM: {str(e)}")
+    
     if start_date > end_date:
         raise HTTPException(status_code=400, detail="Start date must be before end date")
+    
+    # Validate num_docs if provided
+    if num_docs is not None:
+        try:
+            num_docs = int(num_docs)
+            if num_docs < 0:
+                raise HTTPException(status_code=400, detail="num_docs must be non-negative")
+            if num_docs > 100_000_000:  # Reasonable upper limit
+                raise HTTPException(status_code=400, detail="num_docs exceeds maximum allowed (100,000,000)")
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="num_docs must be a valid integer")
 
+    # Clean up old tasks periodically (every 10th request)
+    cleanup_old_tasks()
+    
     task_id = str(uuid.uuid4())
     with _progress_lock:
         task_meta[task_id] = {"start_time": now(), "total_units": 0, "completed_units": 0}
