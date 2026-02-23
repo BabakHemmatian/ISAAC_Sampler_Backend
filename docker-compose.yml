@@ -1,0 +1,34 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: isaac-sampler-backend
+    ports:
+      - "8000:8000"  # Backend API port
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - MEMORY_MODE=performance  # Use performance mode for local development
+    volumes:
+      # Mount temp_files directory to persist temporary files
+      - ./temp_files:/app/temp_files
+    restart: unless-stopped
+    # CPU and memory limits for better resource allocation
+    # Note: VM has 1 VCPU and 4GB RAM, so limits adjusted accordingly
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'  # VM has 1 VCPU
+          memory: 3.5G  # Use 3.5GB (leave 500MB for system)
+        reservations:
+          cpus: '0.5'  # Reserve 0.5 CPU core
+          memory: 512M  # Reserve 512MB
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
