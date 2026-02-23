@@ -1,0 +1,76 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+venv_mac/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+uvicorn.log
+memory_monitor_*.log
+
+# Temporary files
+temp_files/*
+!temp_files/.gitkeep
+*.tmp
+*.bak
+
+# Test files
+test_*.py
+*_test.py
+
+# Documentation
+*.md
+!README.md
+
+# Data files
+*.json
+*.csv
+*.parquet
+*.parq
+*.zip
+
+# Jupyter notebooks
+*.ipynb
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+
+# Backup files
+*_backup_*.py
+app_backup_*.py
+
+# Memory tracking files
+memory_stats_*.json
+memory_stats_*.md
+
+
