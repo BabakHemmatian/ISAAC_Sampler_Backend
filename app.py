@@ -8,6 +8,7 @@ import sys
 import uuid
 import zipfile
 import io
+import csv
 import time
 import threading
 import asyncio
@@ -15,7 +16,7 @@ import gzip
 import traceback 
 import gc
 from datetime import datetime
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
@@ -48,17 +49,13 @@ ALLOWED_ORIGINS = [
     if origin.strip()
 ]
 
-# Log CORS configuration for debugging (only in development)
-if os.getenv("ENVIRONMENT", "production") != "production":
-    print(f"CORS Configuration - Allowed Origins: {ALLOWED_ORIGINS}")
-
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH"],
-    allow_headers=["Content-Type", "Authorization", "Accept", "X-Requested-With"],
+    allow_headers=["*"],
     expose_headers=["*"],
 )
 
@@ -101,16 +98,7 @@ _progress_lock = threading.Lock()
 
 ASSUMED_UPLOAD_BPS = 10 * 1024 * 1024 
 ZIP_PART_SIZE_ROWS = 100_000          
-
-# Memory-efficient mode configuration
-# Set MEMORY_EFFICIENT_MODE=true to enable memory-efficient processing (slower but uses less memory)
-MEMORY_EFFICIENT_MODE = os.getenv("MEMORY_EFFICIENT_MODE", "false").lower() == "true"
-
-# Configure workers based on mode
-if MEMORY_EFFICIENT_MODE:
-    DEFAULT_MAX_WORKERS = 2  # Reduced workers for memory efficiency
-else:
-    DEFAULT_MAX_WORKERS = min(8, os.cpu_count() or 4)  # Default: up to 8 workers
+DEFAULT_MAX_WORKERS = min(2, os.cpu_count() or 2)  # Limited to 2 workers for memory efficiency
 
 # Task cleanup configuration
 TASK_CLEANUP_MAX_AGE_SECONDS = int(os.getenv("TASK_CLEANUP_MAX_AGE_SECONDS", "86400"))  # 24 hours default
@@ -191,7 +179,6 @@ class IssueReport(BaseModel):
     email: EmailStr
     description: str
 
-# CSV reading configuration - use low_memory mode in memory-efficient mode
 READ_CSV_KW = dict(
     usecols=[
         "id", "parent id", "text", "author", "time",
@@ -211,7 +198,7 @@ READ_CSV_KW = dict(
     parse_dates=False,
     engine="c",
     memory_map=False,         
-    low_memory=MEMORY_EFFICIENT_MODE,  # Use low_memory mode when memory-efficient mode is enabled
+    low_memory=False,
 )
 
 
@@ -311,10 +298,7 @@ def upload_file_and_get_presigned(local_path: str, dest_key: str, expires_in: in
     return presigned
 
 
-def sample_csv_reservoir_from_s3(key: str, k: int, chunksize: Optional[int] = None) -> pd.DataFrame:
-    # Use smaller chunk size in memory-efficient mode
-    if chunksize is None:
-        chunksize = 50_000 if MEMORY_EFFICIENT_MODE else 200_000
+def sample_csv_reservoir_from_s3(key: str, k: int, chunksize: int = 50_000) -> pd.DataFrame:
     if k <= 0:
         return pd.DataFrame()
 
@@ -324,20 +308,26 @@ def sample_csv_reservoir_from_s3(key: str, k: int, chunksize: Optional[int] = No
 
     with s3_open_csv_stream(key) as csv_stream:
         for chunk in pd.read_csv(csv_stream, chunksize=chunksize, **READ_CSV_KW):
-            if reservoir is None:
-                take = min(k, len(chunk))
-                if take == 0:
-                    continue
-                reservoir = chunk.iloc[:take].copy()
-                seen += len(chunk)
+            if chunk.empty:
                 continue
 
-            for idx in range(len(chunk)):
+            start_idx = 0
+            if reservoir is None:
+                take = min(k, len(chunk))
+                reservoir = chunk.iloc[:take].copy()
+                seen += take
+                start_idx = take
+            elif len(reservoir) < k:
+                need = min(k - len(reservoir), len(chunk))
+                reservoir = pd.concat([reservoir, chunk.iloc[:need].copy()], ignore_index=True)
+                seen += need
+                start_idx = need
+
+            for idx in range(start_idx, len(chunk)):
                 seen += 1
-                j = rng.integers(0, seen)
-                if j < k:
-                    replace_at = rng.integers(0, k)
-                    reservoir.iloc[replace_at] = chunk.iloc[idx]
+                j = int(rng.integers(0, seen))
+                if j < len(reservoir):
+                    reservoir.iloc[j] = chunk.iloc[idx]
 
     if reservoir is None:
         return pd.DataFrame()
@@ -360,7 +350,7 @@ def sample_parquet_reservoir_from_s3(
     end_ts   = _norm_month_end(end_ts)
 
     path = f"{SUPABASE_BUCKET_NAME}/{key}" if not key.startswith(f"{SUPABASE_BUCKET_NAME}/") else key
-
+    
     with s3_fs.open(path, "rb") as parquet_file:
         pf = pq.ParquetFile(parquet_file)
 
@@ -403,7 +393,7 @@ def sample_parquet_reservoir_from_s3(
         reservoir = None
         seen = 0
 
-        read_cols = columns or None 
+        read_cols = columns or None
         for i in rg_indices:
             tbl: pa.Table = pf.read_row_group(i, columns=read_cols)
             df = tbl.to_pandas(types_mapper=pd.ArrowDtype).reset_index(drop=True)
@@ -417,18 +407,23 @@ def sample_parquet_reservoir_from_s3(
             if df.empty:
                 continue
 
+            start_idx = 0
             if reservoir is None:
                 take = min(k, len(df))
                 reservoir = df.iloc[:take].copy()
-                seen += len(df)
-                continue
+                seen += take
+                start_idx = take
+            elif len(reservoir) < k:
+                need = min(k - len(reservoir), len(df))
+                reservoir = pd.concat([reservoir, df.iloc[:need].copy()], ignore_index=True)
+                seen += need
+                start_idx = need
 
-            for idx in range(len(df)):
+            for idx in range(start_idx, len(df)):
                 seen += 1
-                j = rng.integers(0, seen)
-                if j < k:
-                    replace_at = rng.integers(0, k)
-                    reservoir.iloc[replace_at] = df.iloc[idx]
+                j = int(rng.integers(0, seen))
+                if j < len(reservoir):
+                    reservoir.iloc[j] = df.iloc[idx]
 
         if reservoir is None:
             return pd.DataFrame()
@@ -449,23 +444,72 @@ def sample_any_from_s3(key: str, k: int, start_date: str, end_date: str) -> Opti
     return sample_csv_reservoir_from_s3(key, k)
 
 
+def sample_any_to_temp_csv(
+    key: str,
+    k: int,
+    start_date: str,
+    end_date: str
+) -> Tuple[Optional[str], int]:
+    """Sample from a source file and write the sampled rows directly to a temp CSV."""
+    if k <= 0:
+        return None, 0
+
+    tmp_name = f"sample_{uuid.uuid4().hex}.csv"
+    tmp_path = os.path.join(TEMP_DIR, tmp_name)
+
+    try:
+        df = sample_any_from_s3(key, k, start_date, end_date)
+        if df is None or df.empty:
+            return None, 0
+
+        # Keep source provenance stable in output even when source data omits it.
+        if "source_row" not in df.columns:
+            df["source_row"] = pd.Series([pd.NA] * len(df), dtype="Int64")
+        else:
+            df["source_row"] = pd.to_numeric(df["source_row"], errors="coerce").astype("Int64")
+
+        row_count = len(df)
+        df.to_csv(tmp_path, index=False)
+
+        # Ensure worker memory is released before returning to the caller.
+        del df
+        gc.collect()
+        return tmp_path, row_count
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
+
+
 def compute_per_file_quotas(files: List[Dict], num_docs: int) -> List[int]:
+    if not files:
+        return []
+
     total = sum(max(0, f.get("num_rows", 0) or 0) for f in files)
     if total <= 0:
         base = num_docs // len(files)
         quotas = [base] * len(files)
         quotas[-1] += num_docs - base * len(files)
         return quotas
-    quotas = []
-    assigned = 0
-    for i, f in enumerate(files):
-        if i == len(files) - 1:
-            q = num_docs - assigned
-        else:
-            share = (f.get("num_rows", 0) or 0) / total
-            q = int(round(num_docs * share))
-            assigned += q
-        quotas.append(max(0, q))
+
+    raw_quotas: List[float] = []
+    quotas: List[int] = []
+    for f in files:
+        share = (f.get("num_rows", 0) or 0) / total
+        raw = num_docs * share
+        raw_quotas.append(raw)
+        quotas.append(int(raw))
+
+    remaining = num_docs - sum(quotas)
+    if remaining > 0:
+        order = sorted(
+            range(len(files)),
+            key=lambda i: (raw_quotas[i] - quotas[i], -i),
+            reverse=True
+        )
+        for idx in order[:remaining]:
+            quotas[idx] += 1
+
     return quotas
 
 def _norm_month(s):
@@ -518,7 +562,6 @@ def convert_parquet_to_csv_and_zip(zipf: zipfile.ZipFile, key: str, arcname: str
                 csv_buffer = StringIO()
                 df.to_csv(csv_buffer, index=False)
                 csv_content = csv_buffer.getvalue()
-                
                 with zipf.open(csv_name, "w") as zf:
                     zf.write(csv_content.encode('utf-8'))
                 return True
@@ -552,7 +595,7 @@ def convert_parquet_to_csv_and_zip(zipf: zipfile.ZipFile, key: str, arcname: str
                     first_row_group = False
             
             return True
-            
+        
     except Exception as e:
         print(f"[ERROR] Failed to convert parquet {key}: {e}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
@@ -671,7 +714,7 @@ def zip_originals_from_s3(task_id: str, files: List[Dict], social_group: str,
                     # CSV files - stream directly
                     with zip_lock:
                         return stream_object_to_zip(zipf, key, arcname)
-                        
+                
             except Exception as e:
                 print(f"[ERROR] File processing failed for {file_info.get('file_path', 'unknown')}: {e}", file=sys.stderr)
                 traceback.print_exc(file=sys.stderr)
@@ -755,103 +798,113 @@ def background_sampling(task_id: str, social_group: str, start_date: str,
         total_units = len(files_to_process) + approx_zip_units + 1 
         _set_progress(task_id, stage="Sampling documents", total_units=total_units)
 
+        # Incremental processing: each worker writes sampled rows to disk, then we zip.
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
         zip_filename = f"ISSAC_{social_group}_{start_date}_{end_date}_{timestamp}.zip"
         zip_path = os.path.join(TEMP_DIR, zip_filename)
 
-        def process_one(key: str, k: int) -> Optional[pd.DataFrame]:
-            return sample_any_from_s3(key, k, start_date, end_date)
+        completed_units = 0
+        total_sampled_rows = 0
+        chunk_counter = 0
 
-        if MEMORY_EFFICIENT_MODE:
-            # Memory-efficient mode: Process incrementally, write to zip as we go
-            completed_units = 0
-            total_sampled_rows = 0
-            chunk_counter = 0
+        def process_one(key: str, k: int) -> Tuple[Optional[str], int]:
+            return sample_any_to_temp_csv(key, k, start_date, end_date)
 
-            with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zipf:
-                with ThreadPoolExecutor(max_workers=DEFAULT_MAX_WORKERS) as ex:
-                    futures = [ex.submit(process_one, f["file_path"], q) for f, q in zip(files_to_process, quotas)]
-                    for fut in as_completed(futures):
-                        df = fut.result()
-                        if df is not None and not df.empty:
-                            # Process DataFrame in chunks and write incrementally
-                            for i in range(0, len(df), ZIP_PART_SIZE_ROWS):
-                                part = df.iloc[i:i + ZIP_PART_SIZE_ROWS]
-                                if len(part) == 0:
-                                    continue
-                                
-                                # Write to zip file incrementally
-                                chunk_counter += 1
-                                name = f"ISSAC_{social_group}_{start_date}_{end_date}_{chunk_counter}.csv"
-                                tmp = os.path.join(TEMP_DIR, name)
-                                part.to_csv(tmp, index=False)
-                                zipf.write(tmp, name)
-                                os.remove(tmp)
-                                
-                                total_sampled_rows += len(part)
-                                
-                                # Update progress
-                                completed_units += 1
-                                _set_progress(task_id, completed_units=completed_units, 
-                                            stage=f"Processed {total_sampled_rows} rows")
-                                _update_eta_from_units(task_id)
-                            
-                            # Explicitly delete DataFrame to free memory
-                            del df
-                            gc.collect()
-                        
-                        completed_units += 1
-                        _set_progress(task_id, completed_units=completed_units)
-                        _update_eta_from_units(task_id)
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zipf:
+            sampled_temp_files: List[str] = []
+            current_chunk_name = None
+            current_chunk_path = None
+            current_chunk_file = None
+            current_chunk_writer = None
+            current_chunk_rows = 0
+            canonical_columns: List[str] = []
 
-            if total_sampled_rows == 0:
-                _set_progress(task_id, stage="No data after sampling", eta_seconds=0)
-                if os.path.exists(zip_path):
-                    os.remove(zip_path)
-                return
+            def start_new_chunk() -> None:
+                nonlocal chunk_counter, current_chunk_name, current_chunk_path, current_chunk_file
+                nonlocal current_chunk_writer, current_chunk_rows
+                chunk_counter += 1
+                current_chunk_name = f"ISSAC_{social_group}_{start_date}_{end_date}_{chunk_counter}.csv"
+                current_chunk_path = os.path.join(TEMP_DIR, f"merged_{chunk_counter}_{uuid.uuid4().hex}.csv")
+                current_chunk_file = open(current_chunk_path, "w", encoding="utf-8", newline="")
+                current_chunk_writer = csv.DictWriter(
+                    current_chunk_file,
+                    fieldnames=canonical_columns,
+                    extrasaction="ignore"
+                )
+                current_chunk_writer.writeheader()
+                current_chunk_rows = 0
 
-            zip_chunks = chunk_counter
-            accurate_total_units = len(files) + zip_chunks + 1
-            _set_progress(task_id, stage="Zipping files",
-                          total_units=accurate_total_units, completed_units=completed_units)
-        else:
-            # Default mode: Accumulate all DataFrames, then process
-            completed_units = 0
-            sampled_parts: List[pd.DataFrame] = []
+            def flush_chunk_to_zip() -> None:
+                nonlocal current_chunk_name, current_chunk_path, current_chunk_file
+                nonlocal current_chunk_writer, current_chunk_rows
+                if current_chunk_file is None:
+                    return
+                current_chunk_file.close()
+                zipf.write(current_chunk_path, current_chunk_name)
+                os.remove(current_chunk_path)
+                current_chunk_name = None
+                current_chunk_path = None
+                current_chunk_file = None
+                current_chunk_writer = None
+                current_chunk_rows = 0
 
             with ThreadPoolExecutor(max_workers=DEFAULT_MAX_WORKERS) as ex:
                 futures = [ex.submit(process_one, f["file_path"], q) for f, q in zip(files_to_process, quotas)]
                 for fut in as_completed(futures):
-                    df = fut.result()
-                    if df is not None and not df.empty:
-                        sampled_parts.append(df)
+                    tmp_csv_path, row_count = fut.result()
+                    if tmp_csv_path and row_count > 0:
+                        sampled_temp_files.append(tmp_csv_path)
+                        total_sampled_rows += row_count
+                    
                     completed_units += 1
-                    _set_progress(task_id, completed_units=completed_units)
+                    _set_progress(task_id, completed_units=completed_units, 
+                                stage=f"Sampled {total_sampled_rows} rows so far")
                     _update_eta_from_units(task_id)
 
-            if not sampled_parts:
-                _set_progress(task_id, stage="No data after sampling", eta_seconds=0)
-                return
+            # Pass 1: discover canonical schema (union of columns in encounter order).
+            for tmp_csv_path in sampled_temp_files:
+                with open(tmp_csv_path, "r", encoding="utf-8", newline="") as src:
+                    reader = csv.DictReader(src)
+                    if not reader.fieldnames:
+                        continue
+                    for col in reader.fieldnames:
+                        if col not in canonical_columns:
+                            canonical_columns.append(col)
+            if "source_row" not in canonical_columns:
+                canonical_columns.append("source_row")
 
-            final_df = pd.concat(sampled_parts, ignore_index=True)
+            # Pass 2: stream normalized rows into chunked CSV files.
+            if canonical_columns:
+                for tmp_csv_path in sampled_temp_files:
+                    try:
+                        with open(tmp_csv_path, "r", encoding="utf-8", newline="") as src:
+                            reader = csv.DictReader(src)
+                            if not reader.fieldnames:
+                                continue
+                            for row in reader:
+                                if current_chunk_writer is None:
+                                    start_new_chunk()
+                                current_chunk_writer.writerow(row)
+                                current_chunk_rows += 1
+                                if current_chunk_rows >= ZIP_PART_SIZE_ROWS:
+                                    flush_chunk_to_zip()
+                    finally:
+                        if os.path.exists(tmp_csv_path):
+                            os.remove(tmp_csv_path)
 
-            zip_chunks = max(1, (len(final_df) + ZIP_PART_SIZE_ROWS - 1) // ZIP_PART_SIZE_ROWS)
-            accurate_total_units = len(files) + zip_chunks + 1
-            _set_progress(task_id, stage="Zipping files",
-                          total_units=accurate_total_units, completed_units=completed_units)
+            # Flush the final partial chunk.
+            flush_chunk_to_zip()
 
-            with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zipf:
-                for i in range(0, len(final_df), ZIP_PART_SIZE_ROWS):
-                    part = final_df.iloc[i:i + ZIP_PART_SIZE_ROWS]
-                    name = f"ISSAC_{social_group}_{start_date}_{end_date}_{(i//ZIP_PART_SIZE_ROWS)+1}.csv"
-                    tmp = os.path.join(TEMP_DIR, name)
-                    part.to_csv(tmp, index=False)
-                    zipf.write(tmp, name)
-                    os.remove(tmp)
+        if total_sampled_rows == 0:
+            _set_progress(task_id, stage="No data after sampling", eta_seconds=0)
+            if os.path.exists(zip_path):
+                os.remove(zip_path)
+            return
 
-                    completed_units += 1
-                    _set_progress(task_id, completed_units=completed_units)
-                    _update_eta_from_units(task_id)
+        zip_chunks = chunk_counter
+        accurate_total_units = len(files) + zip_chunks + 1
+        _set_progress(task_id, stage="Zipping files",
+                      total_units=accurate_total_units, completed_units=completed_units)
 
         _set_progress(task_id, stage="Uploading to Supabase Storage")
         object_name = f"samples/{zip_filename}"
