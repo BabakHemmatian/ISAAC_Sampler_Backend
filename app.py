@@ -16,7 +16,7 @@ import gzip
 import traceback 
 import gc
 from datetime import datetime
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
@@ -99,9 +99,12 @@ _progress_lock = threading.Lock()
 ASSUMED_UPLOAD_BPS = 10 * 1024 * 1024 
 ZIP_PART_SIZE_ROWS = 100_000          
 DEFAULT_MAX_WORKERS = min(2, os.cpu_count() or 2)  # Limited to 2 workers for memory efficiency
+ETA_EMA_ALPHA = float(os.getenv("ETA_EMA_ALPHA", "0.25"))
+FULL_RANGE_ZIP_COMPRESSLEVEL = int(os.getenv("FULL_RANGE_ZIP_COMPRESSLEVEL", "1"))
 
 # Task cleanup configuration
 TASK_CLEANUP_MAX_AGE_SECONDS = int(os.getenv("TASK_CLEANUP_MAX_AGE_SECONDS", "86400"))  # 24 hours default
+FULL_RANGE_CSV_FIRST = os.getenv("FULL_RANGE_CSV_FIRST", "0").lower() in ("1", "true", "yes")
 
 def now() -> float:
     return time.time()
@@ -124,9 +127,14 @@ def _set_progress(task_id: str, *, stage: Optional[str] = None,
                   eta_seconds: Optional[float] = None):
     with _progress_lock:
         if stage is not None:
+            prev_stage = task_stage.get(task_id)
             task_stage[task_id] = stage
         meta = task_meta.setdefault(task_id, {})
         prog = task_progress.setdefault(task_id, {"percent": 0.0, "eta_seconds": None, "eta_human": None})
+        if stage is not None and stage != prev_stage:
+            meta.pop("eta_last_completed_units", None)
+            meta.pop("eta_last_ts", None)
+            meta.pop("eta_per_unit_ema", None)
         if total_units is not None:
             meta["total_units"] = total_units
         if completed_units is not None:
@@ -145,15 +153,52 @@ def _update_eta_from_units(task_id: str):
     with _progress_lock:
         meta = task_meta.get(task_id, {})
         start_time = meta.get("start_time")
-        cu = meta.get("completed_units", 0)
-        tu = meta.get("total_units", 0)
-    if not start_time or cu <= 0 or tu <= 0 or cu > tu:
-        return
-    elapsed = now() - start_time
-    avg_per_unit = elapsed / cu
-    remaining_units = tu - cu
-    eta = remaining_units * avg_per_unit
-    _set_progress(task_id, eta_seconds=eta)
+        cu = int(meta.get("completed_units", 0) or 0)
+        tu = int(meta.get("total_units", 0) or 0)
+        now_ts = now()
+
+        if not start_time or cu <= 0 or tu <= 0 or cu > tu:
+            return
+
+        prev_cu = int(meta.get("eta_last_completed_units", 0) or 0)
+        prev_ts = float(meta.get("eta_last_ts", start_time) or start_time)
+        prev_ema = meta.get("eta_per_unit_ema")
+        prev_eta = task_progress.get(task_id, {}).get("eta_seconds")
+
+        completed_delta = cu - prev_cu
+        elapsed_delta = max(0.0, now_ts - prev_ts)
+
+        if completed_delta > 0 and elapsed_delta > 0:
+            inst_per_unit = elapsed_delta / completed_delta
+        else:
+            elapsed_total = max(0.0, now_ts - start_time)
+            inst_per_unit = (elapsed_total / cu) if cu > 0 else None
+
+        if inst_per_unit is None:
+            return
+
+        if prev_ema is None:
+            ema_per_unit = inst_per_unit
+        else:
+            ema_per_unit = (ETA_EMA_ALPHA * inst_per_unit) + ((1.0 - ETA_EMA_ALPHA) * float(prev_ema))
+
+        remaining_units = max(0, tu - cu)
+        raw_eta = remaining_units * ema_per_unit
+
+        # Clamp estimate drift to reduce visible oscillation in UI.
+        if prev_eta is not None:
+            lower = max(0.0, float(prev_eta) * 0.6)
+            upper = max(lower + 1.0, float(prev_eta) * 1.4)
+            eta = min(upper, max(lower, raw_eta))
+        else:
+            eta = raw_eta
+
+        meta["eta_last_completed_units"] = cu
+        meta["eta_last_ts"] = now_ts
+        meta["eta_per_unit_ema"] = ema_per_unit
+        prog = task_progress.setdefault(task_id, {"percent": 0.0, "eta_seconds": None, "eta_human": None})
+        prog["eta_seconds"] = max(0, int(eta))
+        prog["eta_human"] = _fmt_eta(prog["eta_seconds"])
 
 def cleanup_old_tasks(max_age_seconds: int = TASK_CLEANUP_MAX_AGE_SECONDS):
     """Remove tasks older than max_age_seconds to prevent memory leaks."""
@@ -202,20 +247,63 @@ READ_CSV_KW = dict(
 )
 
 
-async def fetch_metadata(social_group: str, start_month: str, end_month: str):
+async def fetch_metadata(
+    social_group: str,
+    start_month: str,
+    end_month: str,
+    *,
+    prefer_csv_for_full_range: bool = False,
+):
     conn = await asyncpg.connect(SUPABASE_DB_URL)
     try:
-        query = """
-        SELECT file_path, num_rows
-        FROM metadata
+        base_where = """
         WHERE social_group = $1
           AND date >= (($2 || '-01')::date)
           AND date <  (($3 || '-01')::date + INTERVAL '1 MONTH')
-        ORDER BY date ASC;
+        ORDER BY date ASC
         """
-        async with conn.transaction():
-            async for record in conn.cursor(query, social_group, start_month, end_month):
-                yield {"file_path": record["file_path"], "num_rows": record["num_rows"]}
+        query_default = f"""
+        SELECT file_path, num_rows
+        FROM metadata
+        {base_where};
+        """
+        # CSV-first export path for full-range jobs. Keeps parquet fallback.
+        query_csv_first = f"""
+        SELECT
+            CASE
+                WHEN csv_available IS TRUE AND csv_file_path IS NOT NULL
+                    THEN csv_file_path
+                ELSE file_path
+            END AS file_path,
+            num_rows,
+            file_path AS source_file_path,
+            CASE
+                WHEN csv_available IS TRUE AND csv_file_path IS NOT NULL
+                    THEN TRUE
+                ELSE FALSE
+            END AS using_csv_companion
+        FROM metadata
+        {base_where};
+        """
+
+        query_to_run = query_csv_first if prefer_csv_for_full_range else query_default
+        try:
+            async with conn.transaction():
+                async for record in conn.cursor(query_to_run, social_group, start_month, end_month):
+                    out = {
+                        "file_path": record["file_path"],
+                        "num_rows": record["num_rows"],
+                    }
+                    if "source_file_path" in record:
+                        out["source_file_path"] = record["source_file_path"]
+                    if "using_csv_companion" in record:
+                        out["using_csv_companion"] = bool(record["using_csv_companion"])
+                    yield out
+        except asyncpg.UndefinedColumnError:
+            # Backward compatible fallback for environments without csv_* columns.
+            async with conn.transaction():
+                async for record in conn.cursor(query_default, social_group, start_month, end_month):
+                    yield {"file_path": record["file_path"], "num_rows": record["num_rows"]}
     finally:
         try:
             await asyncio.sleep(0) 
@@ -223,9 +311,20 @@ async def fetch_metadata(social_group: str, start_month: str, end_month: str):
         except Exception as e:
             print(f"[ERROR] Connection close failed: {e}", file=sys.stderr)
 
-async def fetch_metadata_list(social_group: str, start_month: str, end_month: str):
+async def fetch_metadata_list(
+    social_group: str,
+    start_month: str,
+    end_month: str,
+    *,
+    prefer_csv_for_full_range: bool = False,
+):
     items = []
-    async for item in fetch_metadata(social_group, start_month, end_month):
+    async for item in fetch_metadata(
+        social_group,
+        start_month,
+        end_month,
+        prefer_csv_for_full_range=prefer_csv_for_full_range,
+    ):
         items.append(item)
     return items
 
@@ -248,22 +347,74 @@ def s3_open_csv_stream(key: str) -> io.TextIOBase:
     else:
         return io.TextIOWrapper(body, encoding="utf-8")
 
-def stream_object_to_zip(zipf: zipfile.ZipFile, key: str, arcname: Optional[str] = None, chunk_size: int = 1024*1024):
+def stream_object_to_zip(
+    zipf: zipfile.ZipFile,
+    key: str,
+    arcname: Optional[str] = None,
+    chunk_size: int = 1024 * 1024,
+    stats: Optional[Dict[str, float]] = None,
+):
     if arcname is None:
         arcname = os.path.basename(key)
     
     try:
+        fetch_started = now()
         obj = s3_client.get_object(Bucket=SUPABASE_BUCKET_NAME, Key=key)
+        fetch_elapsed = now() - fetch_started
+        stream_started = now()
+        zip_write_seconds = 0.0
+        source_bytes = 0
+        chunk_count = 0
         with zipf.open(arcname, "w") as zf:
             for chunk in obj["Body"].iter_chunks(chunk_size=chunk_size):
                 if chunk:
+                    chunk_count += 1
+                    source_bytes += len(chunk)
+                    write_started = now()
                     zf.write(chunk)
+                    zip_write_seconds += (now() - write_started)
+        stream_elapsed = now() - stream_started
+        if stats is not None:
+            stats["fetch_seconds"] = float(fetch_elapsed)
+            stats["stream_seconds"] = float(stream_elapsed)
+            stats["zip_write_seconds"] = float(zip_write_seconds)
+            stats["source_read_wait_seconds"] = float(max(0.0, stream_elapsed - zip_write_seconds))
+            stats["source_bytes"] = float(source_bytes)
+            stats["chunk_count"] = float(chunk_count)
         return True
     except Exception as e:
         print(f"[ERROR] Failed to stream {key}: {e}", file=sys.stderr)
         return False
 
-def upload_file_and_get_presigned(local_path: str, dest_key: str, expires_in: int = 3600) -> str:
+def _make_upload_progress_callback(task_id: str, file_size: int) -> Callable[[int], None]:
+    started = now()
+    uploaded = 0
+    last_emit = 0.0
+    lock = threading.Lock()
+
+    def _callback(bytes_amount: int) -> None:
+        nonlocal uploaded, last_emit
+        with lock:
+            uploaded += int(bytes_amount)
+            current = now()
+            if (current - last_emit) < 1.0 and uploaded < file_size:
+                return
+            last_emit = current
+
+            elapsed = max(0.001, current - started)
+            bps = uploaded / elapsed
+            remaining = max(0, file_size - uploaded)
+            eta = (remaining / bps) if bps > 0 else 0
+            _set_progress(task_id, eta_seconds=max(0.0, eta))
+
+    return _callback
+
+def upload_file_and_get_presigned(
+    local_path: str,
+    dest_key: str,
+    expires_in: int = 3600,
+    progress_callback: Optional[Callable[[int], None]] = None,
+) -> str:
     # Use TransferConfig with single-threaded upload to avoid multipart ordering issues
     # This ensures parts are uploaded in order and prevents "parts not in ascending order" errors
     transfer_config = TransferConfig(
@@ -276,7 +427,8 @@ def upload_file_and_get_presigned(local_path: str, dest_key: str, expires_in: in
         local_path, 
         SUPABASE_BUCKET_NAME, 
         dest_key,
-        Config=transfer_config
+        Config=transfer_config,
+        Callback=progress_callback
     )
     
     # Generate presigned URL
@@ -626,25 +778,56 @@ def zip_originals_from_s3(task_id: str, files: List[Dict], social_group: str,
     """
     _set_progress(task_id, stage="Bundling original files (parallelized)")
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-    zip_filename = f"ISSAC_{social_group}_{start_date}_{end_date}_{timestamp}.zip"
+    zip_filename = f"ISAAC_{social_group}_{start_date}_{end_date}_{timestamp}.zip"
     zip_path = os.path.join(TEMP_DIR, zip_filename)
 
     total_files = len(files)
     _set_progress(task_id, total_units=total_files + 1, completed_units=0)
+    csv_stream_candidates = sum(
+        1 for f in files if not str(f.get("file_path", "")).lower().endswith((".parquet", ".parq"))
+    )
+    parquet_fallback_candidates = total_files - csv_stream_candidates
+    _set_progress(task_id, stage=f"Preparing files for download ({total_files})")
+    print(
+        f"[INFO] Full-range CSV-first plan: csv_stream_candidates={csv_stream_candidates}, "
+        f"parquet_fallback_candidates={parquet_fallback_candidates}, total_files={total_files}",
+        file=sys.stderr,
+    )
 
+    pipeline_started = now()
     # Use a lock for thread-safe zip file operations
     zip_lock = threading.Lock()
     completed = 0
     successful = 0
+    csv_stream_success = 0
+    parquet_convert_success = 0
+    csv_fetch_seconds = 0.0
+    csv_stream_seconds = 0.0
+    csv_stream_wait_seconds = 0.0
+    parquet_convert_seconds = 0.0
+    zip_write_seconds = 0.0
+    csv_source_bytes = 0
+    parquet_converted_bytes = 0
     
-    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zipf:
+    with zipfile.ZipFile(
+        zip_path,
+        "w",
+        compression=zipfile.ZIP_DEFLATED,
+        compresslevel=max(0, min(9, FULL_RANGE_ZIP_COMPRESSLEVEL)),
+    ) as zipf:
+        bundle_started = now()
         def process_file_with_lock(file_info: Dict) -> bool:
             """Process a single file and update progress in thread-safe manner."""
             nonlocal completed, successful
+            nonlocal csv_stream_success, parquet_convert_success
+            nonlocal csv_fetch_seconds, csv_stream_seconds, csv_stream_wait_seconds
+            nonlocal parquet_convert_seconds, zip_write_seconds
+            nonlocal csv_source_bytes, parquet_converted_bytes
             try:
                 # Process the file (parquet conversion happens outside lock)
                 key = file_info["file_path"]
                 arcname = os.path.basename(key)
+                file_started = now()
                 
                 if key.lower().endswith(('.parquet', '.parq')):
                     # Convert parquet to CSV in memory, then add to zip
@@ -658,6 +841,7 @@ def zip_originals_from_s3(task_id: str, files: List[Dict], social_group: str,
                             
                             if num_row_groups == 0:
                                 # Fallback: read entire file
+                                convert_started = now()
                                 table = pf.read()
                                 df = table.to_pandas()
                                 if df.empty:
@@ -667,14 +851,22 @@ def zip_originals_from_s3(task_id: str, files: List[Dict], social_group: str,
                                 csv_buffer = StringIO()
                                 df.to_csv(csv_buffer, index=False)
                                 csv_content = csv_buffer.getvalue().encode('utf-8')
+                                convert_elapsed = now() - convert_started
                                 
                                 # Add to zip file (thread-safe operation)
+                                write_started = now()
                                 with zip_lock:
                                     with zipf.open(csv_name, "w") as zf:
                                         zf.write(csv_content)
+                                    parquet_convert_success += 1
+                                    parquet_convert_seconds += convert_elapsed
+                                    write_elapsed = now() - write_started
+                                    zip_write_seconds += write_elapsed
+                                    parquet_converted_bytes += len(csv_content)
                                 return True
                             
                             # Stream row groups for memory efficiency
+                            convert_started = now()
                             csv_chunks = []
                             first_row_group = True
                             
@@ -698,12 +890,20 @@ def zip_originals_from_s3(task_id: str, files: List[Dict], social_group: str,
                                 
                                 csv_chunks.append(csv_content.encode('utf-8'))
                                 first_row_group = False
+                            convert_elapsed = now() - convert_started
                         
                         # Add to zip file (thread-safe operation)
+                        chunk_bytes = sum(len(chunk) for chunk in csv_chunks)
+                        write_started = now()
                         with zip_lock:
                             with zipf.open(csv_name, "w") as zf:
                                 for chunk in csv_chunks:
                                     zf.write(chunk)
+                            parquet_convert_success += 1
+                            parquet_convert_seconds += convert_elapsed
+                            write_elapsed = now() - write_started
+                            zip_write_seconds += write_elapsed
+                            parquet_converted_bytes += chunk_bytes
                         
                         return True
                     except Exception as e:
@@ -712,8 +912,17 @@ def zip_originals_from_s3(task_id: str, files: List[Dict], social_group: str,
                         return False
                 else:
                     # CSV files - stream directly
+                    stream_stats: Dict[str, float] = {}
                     with zip_lock:
-                        return stream_object_to_zip(zipf, key, arcname)
+                        ok = stream_object_to_zip(zipf, key, arcname, stats=stream_stats)
+                        if ok:
+                            csv_stream_success += 1
+                            csv_fetch_seconds += stream_stats.get("fetch_seconds", 0.0)
+                            csv_stream_seconds += stream_stats.get("stream_seconds", 0.0)
+                            csv_stream_wait_seconds += stream_stats.get("source_read_wait_seconds", 0.0)
+                            zip_write_seconds += stream_stats.get("zip_write_seconds", 0.0)
+                            csv_source_bytes += int(stream_stats.get("source_bytes", 0.0))
+                        return ok
                 
             except Exception as e:
                 print(f"[ERROR] File processing failed for {file_info.get('file_path', 'unknown')}: {e}", file=sys.stderr)
@@ -727,7 +936,10 @@ def zip_originals_from_s3(task_id: str, files: List[Dict], social_group: str,
                     _update_eta_from_units(task_id)
                     
                     if completed % max(1, total_files // 10) == 0:
-                        _set_progress(task_id, stage=f"Processed {completed}/{total_files} files ({successful} successful)")
+                        _set_progress(
+                            task_id,
+                            stage=f"Processed {completed}/{total_files} files",
+                        )
         
         # Process files in parallel using ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=DEFAULT_MAX_WORKERS) as executor:
@@ -741,18 +953,44 @@ def zip_originals_from_s3(task_id: str, files: List[Dict], social_group: str,
                             successful += 1
                 except Exception as e:
                     print(f"[ERROR] Future failed: {e}", file=sys.stderr)
+        bundling_elapsed = now() - bundle_started
 
     _set_progress(task_id, stage="Uploading to Supabase Storage")
     object_name = f"samples/{zip_filename}"
     file_size = os.path.getsize(zip_path)
     
-    estimated_upload_time = max(1, file_size / (ASSUMED_UPLOAD_BPS * 2))
+    estimated_upload_time = max(1, file_size / ASSUMED_UPLOAD_BPS)
     _set_progress(task_id, eta_seconds=estimated_upload_time)
+    upload_progress_cb = _make_upload_progress_callback(task_id, file_size)
 
-    presigned = upload_file_and_get_presigned(zip_path, object_name, expires_in=3600)
+    upload_started = now()
+    presigned = upload_file_and_get_presigned(
+        zip_path,
+        object_name,
+        expires_in=3600,
+        progress_callback=upload_progress_cb,
+    )
+    upload_elapsed = now() - upload_started
 
     _set_progress(task_id, completed_units=total_files + 1, eta_seconds=0)
-    print(f"[INFO] Fast path completed: {successful}/{total_files} files processed successfully", file=sys.stderr)
+    print(
+        f"[INFO] Full-range CSV-first completed: successful={successful}/{total_files}, "
+        f"csv_stream_candidates={csv_stream_candidates}, "
+        f"parquet_fallback_candidates={parquet_fallback_candidates}, "
+        f"csv_stream_success={csv_stream_success}, "
+        f"parquet_convert_success={parquet_convert_success}, "
+        f"csv_fetch_seconds={csv_fetch_seconds:.2f}, "
+        f"csv_stream_seconds={csv_stream_seconds:.2f}, "
+        f"csv_stream_wait_seconds={csv_stream_wait_seconds:.2f}, "
+        f"parquet_convert_seconds={parquet_convert_seconds:.2f}, "
+        f"zip_write_seconds={zip_write_seconds:.2f}, "
+        f"csv_source_mb={(csv_source_bytes / (1024 * 1024)):.2f}, "
+        f"parquet_converted_mb={(parquet_converted_bytes / (1024 * 1024)):.2f}, "
+        f"bundling_seconds={bundling_elapsed:.2f}, "
+        f"upload_seconds={upload_elapsed:.2f}, "
+        f"total_pipeline_seconds={(now() - pipeline_started):.2f}",
+        file=sys.stderr,
+    )
     
     # Clean up old tasks after successful completion
     cleanup_old_tasks()
@@ -768,7 +1006,12 @@ def background_sampling(task_id: str, social_group: str, start_date: str,
         _set_progress(task_id, stage="Fetching metadata")
         try:
             files = run_coro_in_new_loop(
-                fetch_metadata_list(social_group, start_date, end_date),
+                fetch_metadata_list(
+                    social_group,
+                    start_date,
+                    end_date,
+                    prefer_csv_for_full_range=(num_docs is None and FULL_RANGE_CSV_FIRST),
+                ),
                 overall_timeout=overall_timeout
             )
         except Exception as e:
@@ -783,7 +1026,21 @@ def background_sampling(task_id: str, social_group: str, start_date: str,
         processed_files = files
 
         if num_docs is None:
-            url = zip_originals_from_s3(task_id, processed_files, social_group, start_date, end_date)
+            # CSV companion mapping can map many parquet parts to one monthly CSV.
+            # Deduplicate by export path to avoid writing the same CSV repeatedly.
+            dedup_map: Dict[str, Dict] = {}
+            for f in processed_files:
+                key = f.get("file_path")
+                if key and key not in dedup_map:
+                    dedup_map[key] = f
+            deduped_files = list(dedup_map.values())
+            if len(deduped_files) != len(processed_files):
+                print(
+                    f"[INFO] Full-range dedupe reduced files: "
+                    f"{len(processed_files)} -> {len(deduped_files)}",
+                    file=sys.stderr,
+                )
+            url = zip_originals_from_s3(task_id, deduped_files, social_group, start_date, end_date)
             task_results[task_id] = url
             _set_progress(task_id, stage="Done", eta_seconds=0)
             return
@@ -800,7 +1057,7 @@ def background_sampling(task_id: str, social_group: str, start_date: str,
 
         # Incremental processing: each worker writes sampled rows to disk, then we zip.
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-        zip_filename = f"ISSAC_{social_group}_{start_date}_{end_date}_{timestamp}.zip"
+        zip_filename = f"ISAAC_{social_group}_{start_date}_{end_date}_{timestamp}.zip"
         zip_path = os.path.join(TEMP_DIR, zip_filename)
 
         completed_units = 0
@@ -823,7 +1080,7 @@ def background_sampling(task_id: str, social_group: str, start_date: str,
                 nonlocal chunk_counter, current_chunk_name, current_chunk_path, current_chunk_file
                 nonlocal current_chunk_writer, current_chunk_rows
                 chunk_counter += 1
-                current_chunk_name = f"ISSAC_{social_group}_{start_date}_{end_date}_{chunk_counter}.csv"
+                current_chunk_name = f"ISAAC_{social_group}_{start_date}_{end_date}_{chunk_counter}.csv"
                 current_chunk_path = os.path.join(TEMP_DIR, f"merged_{chunk_counter}_{uuid.uuid4().hex}.csv")
                 current_chunk_file = open(current_chunk_path, "w", encoding="utf-8", newline="")
                 current_chunk_writer = csv.DictWriter(
@@ -848,18 +1105,104 @@ def background_sampling(task_id: str, social_group: str, start_date: str,
                 current_chunk_writer = None
                 current_chunk_rows = 0
 
+            file_results = [
+                {
+                    "key": f["file_path"],
+                    "meta_rows": max(0, int(f.get("num_rows") or 0)),
+                    "requested": q,
+                    "row_count": 0,
+                    "tmp_csv_path": None,
+                }
+                for f, q in zip(files_to_process, quotas)
+            ]
+
             with ThreadPoolExecutor(max_workers=DEFAULT_MAX_WORKERS) as ex:
-                futures = [ex.submit(process_one, f["file_path"], q) for f, q in zip(files_to_process, quotas)]
+                futures = {
+                    ex.submit(process_one, fr["key"], fr["requested"]): fr
+                    for fr in file_results
+                }
                 for fut in as_completed(futures):
+                    fr = futures[fut]
                     tmp_csv_path, row_count = fut.result()
                     if tmp_csv_path and row_count > 0:
-                        sampled_temp_files.append(tmp_csv_path)
+                        fr["tmp_csv_path"] = tmp_csv_path
+                        fr["row_count"] = row_count
                         total_sampled_rows += row_count
-                    
+                    else:
+                        fr["tmp_csv_path"] = None
+                        fr["row_count"] = 0
+                        if tmp_csv_path and os.path.exists(tmp_csv_path):
+                            os.remove(tmp_csv_path)
+
                     completed_units += 1
-                    _set_progress(task_id, completed_units=completed_units, 
-                                stage=f"Sampled {total_sampled_rows} rows so far")
+                    _set_progress(
+                        task_id,
+                        completed_units=completed_units,
+                        stage=f"Sampled {total_sampled_rows} rows so far"
+                    )
                     _update_eta_from_units(task_id)
+
+            # Top-up pass: if first pass under-returns, retry selected files with larger k.
+            # This helps reach exact requested counts when metadata overestimates some files.
+            if num_docs and total_sampled_rows < num_docs:
+                deficit = num_docs - total_sampled_rows
+                _set_progress(task_id, stage=f"Top-up sampling ({total_sampled_rows}/{num_docs})")
+                print(
+                    f"[INFO] Top-up pass starting: sampled={total_sampled_rows}, "
+                    f"requested={num_docs}, deficit={deficit}",
+                    file=sys.stderr,
+                )
+
+                # Prefer files with larger estimated remaining capacity.
+                candidates = sorted(
+                    file_results,
+                    key=lambda fr: max(0, fr["meta_rows"] - fr["row_count"]),
+                    reverse=True
+                )
+
+                for fr in candidates:
+                    if deficit <= 0:
+                        break
+
+                    spare_estimate = max(0, fr["meta_rows"] - fr["row_count"])
+                    if spare_estimate <= 0:
+                        continue
+
+                    grow_by = min(deficit, spare_estimate)
+                    target_k = fr["row_count"] + grow_by
+                    new_tmp_csv_path, new_row_count = process_one(fr["key"], target_k)
+
+                    if new_tmp_csv_path and new_row_count > fr["row_count"]:
+                        old_tmp_csv_path = fr["tmp_csv_path"]
+                        if old_tmp_csv_path and os.path.exists(old_tmp_csv_path):
+                            os.remove(old_tmp_csv_path)
+
+                        gained = new_row_count - fr["row_count"]
+                        fr["tmp_csv_path"] = new_tmp_csv_path
+                        fr["row_count"] = new_row_count
+                        total_sampled_rows += gained
+                        deficit -= gained
+                        print(
+                            f"[INFO] Top-up gained={gained} from {fr['key']} "
+                            f"(new_row_count={new_row_count}, remaining_deficit={deficit})",
+                            file=sys.stderr,
+                        )
+                    else:
+                        if new_tmp_csv_path and os.path.exists(new_tmp_csv_path):
+                            os.remove(new_tmp_csv_path)
+
+                    _set_progress(task_id, stage=f"Top-up sampled {total_sampled_rows}/{num_docs} rows")
+                print(
+                    f"[INFO] Top-up pass finished: final_sampled={total_sampled_rows}, "
+                    f"remaining_deficit={max(0, num_docs - total_sampled_rows)}",
+                    file=sys.stderr,
+                )
+
+            sampled_temp_files = [
+                fr["tmp_csv_path"]
+                for fr in file_results
+                if fr["tmp_csv_path"] and fr["row_count"] > 0
+            ]
 
             # Pass 1: discover canonical schema (union of columns in encounter order).
             for tmp_csv_path in sampled_temp_files:
@@ -910,8 +1253,14 @@ def background_sampling(task_id: str, social_group: str, start_date: str,
         object_name = f"samples/{zip_filename}"
         file_size = os.path.getsize(zip_path)
         _set_progress(task_id, eta_seconds=(file_size / ASSUMED_UPLOAD_BPS))
+        upload_progress_cb = _make_upload_progress_callback(task_id, file_size)
 
-        presigned = upload_file_and_get_presigned(zip_path, object_name, expires_in=3600)
+        presigned = upload_file_and_get_presigned(
+            zip_path,
+            object_name,
+            expires_in=3600,
+            progress_callback=upload_progress_cb,
+        )
 
         completed_units += 1
         _set_progress(task_id, completed_units=completed_units, eta_seconds=0)
