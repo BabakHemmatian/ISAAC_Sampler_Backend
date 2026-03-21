@@ -1,6 +1,5 @@
+# package and function imports
 from __future__ import annotations
-
-### Imports
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,9 +17,10 @@ import threading
 import asyncio
 import gzip
 import traceback
+import gc
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, List, Dict, Tuple, Callable, Any
+from typing import Optional, List, Dict, Tuple, Callable, Any, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict
 import uvicorn
@@ -32,10 +32,10 @@ from dotenv import load_dotenv
 import pyarrow as pa
 import pyarrow.parquet as pq
 import re
+from calendar import monthrange
 
-### Env / config / constants
-
-load_dotenv() # load environment variables from the .env file
+# load key-value pairs from .env file
+load_dotenv()
 
 # path variables
 APP_DIR = Path(__file__).resolve().parent
@@ -43,6 +43,7 @@ PROJECT_ROOT = APP_DIR
 METADATA_PATH = PROJECT_ROOT / "local_metadata.csv"
 BULK_DIR = PROJECT_ROOT / "bulk"
 DATASET_ROOT = BULK_DIR / "data"
+LOCAL_METADATA_PATH = APP_DIR / "local_metadata.csv"
 TEMP_DIR = BULK_DIR / "temp_files"
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -69,6 +70,7 @@ FULL_RANGE_ZIP_COMPRESSLEVEL = int(os.getenv("FULL_RANGE_ZIP_COMPRESSLEVEL", "1"
 FULL_RANGE_CSV_FIRST = os.getenv("FULL_RANGE_CSV_FIRST", "1").lower() in ("1", "true", "yes")
 TASK_CLEANUP_MAX_AGE_SECONDS = int(os.getenv("TASK_CLEANUP_MAX_AGE_SECONDS", "86400"))
 TEMP_FILE_MAX_AGE_SECONDS = int(os.getenv("TEMP_FILE_MAX_AGE_SECONDS", str(48 * 3600)))
+PROGRESS_UPDATE_INTERVAL_SECONDS = float(os.getenv("PROGRESS_UPDATE_INTERVAL_SECONDS", "0.5"))
 CSV_PROGRESS_ROWS_PER_UNIT = int(os.getenv("CSV_PROGRESS_ROWS_PER_UNIT", "250000"))
 ETA_MIN_SAMPLES = int(os.getenv("ETA_MIN_SAMPLES", "3"))
 SAMPLING_PROGRESS_MIN_INTERVAL_SECONDS = float(os.getenv("SAMPLING_PROGRESS_MIN_INTERVAL_SECONDS", "1.0"))
@@ -77,7 +79,9 @@ PARQUET_SAMPLE_MAX_ROWS = int(os.getenv("PARQUET_SAMPLE_MAX_ROWS", "200000"))
 SMALL_FILE_ROWS_THRESHOLD = int(os.getenv("SMALL_FILE_ROWS_THRESHOLD", "300000"))
 ZIP_STREAM_CHUNK_SIZE = int(os.getenv("ZIP_STREAM_CHUNK_SIZE", str(4 * 1024 * 1024)))
 
-# regex for identifying monthly data files
+### Utils
+
+# regex for identifying monthly files in the local database
 MONTH_FILE_RE = re.compile(
     r"^(?:RC|RS)_(\d{4})-(\d{2})(?:_part\d+_\d+)?\.(csv|csv\.gz|parquet|parq)$",
     re.IGNORECASE,
@@ -106,8 +110,7 @@ READ_CSV_KW = dict(
     low_memory=False,
 )
 
-### Global state containers
-
+# create task containers
 task_progress: Dict[str, Dict[str, Any]] = {}
 task_stage: Dict[str, str] = {}
 task_results: Dict[str, str] = {}
@@ -120,9 +123,7 @@ _metadata_cache: Dict[str, Any] = {
     "rows": None,
 }
 
-### Small generic helpers
-
-# get time
+# time helper
 def now() -> float:
     return time.time()
 
@@ -163,12 +164,12 @@ def cleanup_old_tasks(max_age_seconds: int = TASK_CLEANUP_MAX_AGE_SECONDS) -> No
     if tasks_to_remove:
         print(f"[INFO] Cleaned up {len(tasks_to_remove)} old task(s)", file=sys.stderr)
 
-# metadata modification time
+# Time of last metadata modification
 def _metadata_mtime() -> float:
     try:
-        return METADATA_PATH.stat().st_mtime
+        return LOCAL_METADATA_PATH.stat().st_mtime
     except FileNotFoundError:
-        raise RuntimeError(f"Missing local metadata file: {METADATA_PATH}")
+        raise RuntimeError(f"Missing local metadata file: {LOCAL_METADATA_PATH}")
 
 # load metadata from local storage
 def _load_local_metadata_rows() -> List[Dict[str, Any]]:
@@ -177,7 +178,7 @@ def _load_local_metadata_rows() -> List[Dict[str, Any]]:
         return _metadata_cache["rows"]
 
     rows: List[Dict[str, Any]] = []
-    with open(METADATA_PATH, "r", encoding="utf-8", newline="") as f:
+    with open(LOCAL_METADATA_PATH, "r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         for raw in reader:
             date_val = (raw.get("date") or "").strip()
@@ -188,14 +189,14 @@ def _load_local_metadata_rows() -> List[Dict[str, Any]]:
                 "date": date_val,
                 "month_key": month_key,
                 "file_path": (raw.get("file_path") or "").strip(),
-                "num_rows": int(raw["num_rows"]) if raw.get("num_rows") not in (None, "") else 0,
+                "num_rows": int(raw["num_rows"]) if raw.get("num_rows") not in (None, "",) else 0,
                 "file_format": (raw.get("file_format") or "").strip().lower(),
-                "size_bytes": int(raw["size_bytes"]) if raw.get("size_bytes") not in (None, "") else 0,
-                "row_groups": int(raw["row_groups"]) if raw.get("row_groups") not in (None, "") else 0,
+                "size_bytes": int(raw["size_bytes"]) if raw.get("size_bytes") not in (None, "",) else 0,
+                "row_groups": int(raw["row_groups"]) if raw.get("row_groups") not in (None, "",) else 0,
                 "ts_min": (raw.get("ts_min") or "").strip() or None,
                 "ts_max": (raw.get("ts_max") or "").strip() or None,
-                "year": int(raw["year"]) if raw.get("year") not in (None, "") else None,
-                "month": int(raw["month"]) if raw.get("month") not in (None, "") else None,
+                "year": int(raw["year"]) if raw.get("year") not in (None, "",) else None,
+                "month": int(raw["month"]) if raw.get("month") not in (None, "",) else None,
                 "csv_file_path": (raw.get("csv_file_path") or "").strip(),
                 "csv_available": str(raw.get("csv_available", "")).strip().lower() in ("1", "true", "yes"),
             }
@@ -212,32 +213,35 @@ def _resolve_dataset_path(rel_or_abs: str) -> str:
         return str(path)
     return str((DATASET_ROOT / path).resolve())
 
-# run coroutine in a new loop
-def run_coro_in_new_loop(coro, overall_timeout: int):
-    result_box: Dict[str, Any] = {}
-    error_box: Dict[str, Exception] = {}
-    done_evt = threading.Event()
+# identify the months in the request range
+def month_in_range(year: int, month: int, start_month: str, end_month: str) -> bool:
+    start_key = int(start_month[:4]) * 100 + int(start_month[5:7])
+    end_key = int(end_month[:4]) * 100 + int(end_month[5:7])
+    this_key = year * 100 + month
+    return start_key <= this_key <= end_key
 
-    def _runner():
-        try:
-            result_box["value"] = asyncio.run(asyncio.wait_for(coro, timeout=overall_timeout))
-        except Exception as e:
-            error_box["exc"] = e
-        finally:
-            done_evt.set()
+### App creation
 
-    t = threading.Thread(target=_runner, daemon=True)
-    t.start()
-    if not done_evt.wait(overall_timeout + 5):
-        raise TimeoutError("Timed out waiting for async operation to finish")
+# create the FastAPI app object
+app = FastAPI()
 
-    if "exc" in error_box:
-        raise error_box["exc"]
-    return result_box.get("value")
+# Apply CORS to defined origins
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS or ["http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-### Progress / ETA helpers
+# create a class for issue reports
+class IssueReport(BaseModel):
+    email: EmailStr
+    description: str
 
-# format ETA seconds as human-readable text
+### ETA
+
+# ETA report
 def _fmt_eta(seconds: Optional[float]) -> Optional[str]:
     if seconds is None:
         return None
@@ -250,7 +254,7 @@ def _fmt_eta(seconds: Optional[float]) -> Optional[str]:
         return f"{m}m {s}s"
     return f"{s}s"
 
-# update stored progress state
+# ETA progress evaluation
 def _set_progress(
     task_id: str,
     *,
@@ -339,7 +343,7 @@ def _update_eta_from_units(task_id: str) -> None:
         task_progress.setdefault(task_id, {})["eta_seconds"] = eta
         task_progress.setdefault(task_id, {})["eta_human"] = _fmt_eta(eta)
 
-# initialize progress metadata
+# initial progress metadata
 def _init_progress_meta(task_id: str, total_units: int, stage: str) -> None:
     with _progress_lock:
         task_meta[task_id] = {
@@ -354,7 +358,7 @@ def _init_progress_meta(task_id: str, total_units: int, stage: str) -> None:
         task_progress[task_id] = {"percent": 0.0, "eta_seconds": None, "eta_human": None}
         task_stage[task_id] = stage
 
-# increment progress for ETA display
+# incremental progress evaluation
 def _increment_progress(task_id: str, units: int, stage: Optional[str] = None) -> None:
     if units <= 0:
         return
@@ -381,8 +385,7 @@ def _increment_progress(task_id: str, units: int, stage: Optional[str] = None) -
     _set_progress(task_id, stage=stage)
     _update_eta_from_units(task_id)
 
-### File-format helpers
-
+# fetch metadata from local storage
 async def fetch_metadata(
     social_group: str,
     start_month: str,
@@ -426,6 +429,7 @@ async def fetch_metadata(
     for item in selected:
         yield item
 
+# fetch file list
 async def fetch_metadata_list(
     social_group: str,
     start_month: str,
@@ -443,14 +447,28 @@ async def fetch_metadata_list(
         items.append(item)
     return items
 
-
+# CSV reader stream
 def open_csv_stream_local(path_str: str) -> io.TextIOBase:
     path = Path(path_str)
     if path.name.lower().endswith(".csv.gz"):
         return gzip.open(path, "rt", encoding="utf-8")
     return open(path, "r", encoding="utf-8", newline="")
 
-# sore sampled rows by file-line location
+# estimate number of rows in a local data file
+def estimate_num_rows_local(path: Path) -> int:
+    lower = path.name.lower()
+    try:
+        if lower.endswith((".parquet", ".parq")):
+            pf = pq.ParquetFile(path)
+            return pf.metadata.num_rows if pf.metadata else 0
+        opener = gzip.open if lower.endswith(".gz") else open
+        with opener(path, "rt", encoding="utf-8", newline="") as f:
+            rows = sum(1 for _ in f)
+        return max(0, rows - 1)
+    except Exception:
+        return 0
+
+# sort sample positions
 def _build_sorted_sample_positions(total_rows: int, k: int) -> np.ndarray:
     if total_rows <= 0 or k <= 0:
         return np.empty(0, dtype=np.int64)
@@ -460,12 +478,14 @@ def _build_sorted_sample_positions(total_rows: int, k: int) -> np.ndarray:
     rng = np.random.default_rng()
     return np.sort(rng.choice(total_rows, size=k, replace=False).astype(np.int64, copy=False))
 
+# write csv chunk to file
 def _write_csv_chunk_to_file(df: pd.DataFrame, out_file: io.TextIOBase, *, header: bool) -> int:
     if df.empty:
         return 0
     df.to_csv(out_file, index=False, header=header)
     return len(df)
 
+# copy sampled csv rows to temp csv
 def sample_csv_positions_to_temp_csv(
     path_str: str,
     positions: np.ndarray,
@@ -516,6 +536,7 @@ def _parquet_row_group_sizes(pf: pq.ParquetFile) -> List[int]:
         return []
     return [md.row_group(i).num_rows for i in range(md.num_row_groups)]
 
+# copy sampled parquet rows to temp csv
 def sample_parquet_positions_to_temp_csv(
     path_str: str,
     positions: np.ndarray,
@@ -568,6 +589,7 @@ def sample_parquet_positions_to_temp_csv(
 
     return rows_written
 
+# identify the sampling path
 def choose_sampling_path(file_info: Dict[str, Any], quota: int) -> str:
     primary_path = file_info["file_path"]
     csv_path = file_info.get("csv_file_path") or ""
@@ -586,14 +608,10 @@ def choose_sampling_path(file_info: Dict[str, Any], quota: int) -> str:
         return csv_path
 
     ratio = quota / max(1, num_rows)
-    prefer_parquet = (
-        row_groups > 0
-        and quota <= PARQUET_SAMPLE_MAX_ROWS
-        and ratio <= PARQUET_SAMPLE_RATIO_THRESHOLD
-        and num_rows > SMALL_FILE_ROWS_THRESHOLD
-    )
+    prefer_parquet = row_groups > 0 and quota <= PARQUET_SAMPLE_MAX_ROWS and ratio <= PARQUET_SAMPLE_RATIO_THRESHOLD and num_rows > SMALL_FILE_ROWS_THRESHOLD
     return primary_path if prefer_parquet else csv_path
 
+# sample any file format to temp csv
 def sample_any_to_temp_csv(
     file_info: Dict[str, Any],
     k: int,
@@ -643,69 +661,7 @@ def sample_any_to_temp_csv(
             os.remove(tmp_path)
         raise
 
-def stream_csv_like_to_zip(
-    zipf: zipfile.ZipFile,
-    path_str: str,
-    arcname: Optional[str] = None,
-    chunk_size: int = ZIP_STREAM_CHUNK_SIZE,
-) -> bool:
-    path = Path(path_str)
-    if arcname is None:
-        arcname = path.name
-    lower = path.name.lower()
-    if lower.endswith(".csv.gz"):
-        arcname = path.name[:-3]
-        opener = gzip.open
-    else:
-        opener = open
-
-    try:
-        with opener(path, "rb") as src, zipf.open(arcname, "w") as zf:
-            while True:
-                chunk = src.read(chunk_size)
-                if not chunk:
-                    break
-                zf.write(chunk)
-        return True
-    except Exception as e:
-        print(f"[ERROR] Failed to stream local file {path}: {e}", file=sys.stderr)
-        return False
-
-def stream_parquet_as_csv_to_zip(zipf: zipfile.ZipFile, key: str, columns: Optional[List[str]] = None) -> bool:
-    path = Path(key)
-    csv_name = path.name.replace(".parquet", ".csv").replace(".parq", ".csv")
-    try:
-        pf = pq.ParquetFile(path)
-        with zipf.open(csv_name, "w") as raw_out:
-            txt_out = io.TextIOWrapper(raw_out, encoding="utf-8", newline="", write_through=True)
-            first_chunk = True
-            num_row_groups = pf.metadata.num_row_groups if pf.metadata else 0
-            if num_row_groups == 0:
-                table = pf.read(columns=columns)
-                df = table.to_pandas(types_mapper=pd.ArrowDtype)
-                if df.empty:
-                    txt_out.flush()
-                    return False
-                df.to_csv(txt_out, index=False, header=True)
-            else:
-                for i in range(num_row_groups):
-                    table = pf.read_row_group(i, columns=columns)
-                    if table.num_rows <= 0:
-                        continue
-                    df = table.to_pandas(types_mapper=pd.ArrowDtype)
-                    if df.empty:
-                        continue
-                    df.to_csv(txt_out, index=False, header=first_chunk)
-                    first_chunk = False
-            txt_out.flush()
-        return True
-    except Exception as e:
-        print(f"[ERROR] Failed to convert parquet {key}: {e}", file=sys.stderr)
-        traceback.print_exc(file=sys.stderr)
-        return False
-
-### Orchestration helpers
-
+# identify number of sampled rows per data file
 def compute_per_file_quotas(files: List[Dict[str, Any]], num_docs: int) -> List[int]:
     if not files:
         return []
@@ -744,6 +700,7 @@ def compute_per_file_quotas(files: List[Dict[str, Any]], num_docs: int) -> List[
 
     return quotas
 
+# compute sampling units for ETA evaluation
 def compute_sampling_total_units(files: List[Dict[str, Any]], quotas: List[int]) -> int:
     total = 0
     for file_info, quota in zip(files, quotas):
@@ -756,6 +713,64 @@ def compute_sampling_total_units(files: List[Dict[str, Any]], quotas: List[int])
         else:
             total += num_rows
     return max(total, 1)
+
+# stream CSV to zip
+def stream_csv_like_to_zip(zipf: zipfile.ZipFile, path_str: str, arcname: Optional[str] = None, chunk_size: int = ZIP_STREAM_CHUNK_SIZE) -> bool:
+    path = Path(path_str)
+    if arcname is None:
+        arcname = path.name
+    lower = path.name.lower()
+    if lower.endswith(".csv.gz"):
+        arcname = path.name[:-3]
+        opener = gzip.open
+    else:
+        opener = open
+
+    try:
+        with opener(path, "rb") as src, zipf.open(arcname, "w") as zf:
+            while True:
+                chunk = src.read(chunk_size)
+                if not chunk:
+                    break
+                zf.write(chunk)
+        return True
+    except Exception as e:
+        print(f"[ERROR] Failed to stream local file {path}: {e}", file=sys.stderr)
+        return False
+
+# stream parquet as csv to zip file
+def stream_parquet_as_csv_to_zip(zipf: zipfile.ZipFile, key: str, columns: Optional[List[str]] = None) -> bool:
+    path = Path(key)
+    csv_name = path.name.replace(".parquet", ".csv").replace(".parq", ".csv")
+    try:
+        pf = pq.ParquetFile(path)
+        with zipf.open(csv_name, "w") as raw_out:
+            txt_out = io.TextIOWrapper(raw_out, encoding="utf-8", newline="", write_through=True)
+            first_chunk = True
+            num_row_groups = pf.metadata.num_row_groups if pf.metadata else 0
+            if num_row_groups == 0:
+                table = pf.read(columns=columns)
+                df = table.to_pandas(types_mapper=pd.ArrowDtype)
+                if df.empty:
+                    txt_out.flush()
+                    return False
+                df.to_csv(txt_out, index=False, header=True)
+            else:
+                for i in range(num_row_groups):
+                    table = pf.read_row_group(i, columns=columns)
+                    if table.num_rows <= 0:
+                        continue
+                    df = table.to_pandas(types_mapper=pd.ArrowDtype)
+                    if df.empty:
+                        continue
+                    df.to_csv(txt_out, index=False, header=first_chunk)
+                    first_chunk = False
+            txt_out.flush()
+        return True
+    except Exception as e:
+        print(f"[ERROR] Failed to convert parquet {key}: {e}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        return False
 
 # for full month requests, zip the originals from the local dataset
 def zip_originals_from_local(task_id: str, files: List[Dict[str, Any]], social_group: str, start_date: str, end_date: str) -> str:
@@ -775,7 +790,6 @@ def zip_originals_from_local(task_id: str, files: List[Dict[str, Any]], social_g
         compression=zipfile.ZIP_DEFLATED,
         compresslevel=max(0, min(9, FULL_RANGE_ZIP_COMPRESSLEVEL)),
     ) as zipf:
-
         def process_one(file_info: Dict[str, Any]) -> bool:
             primary_key = file_info["file_path"]
             csv_key = file_info.get("csv_file_path") or ""
@@ -985,32 +999,35 @@ def background_sampling(task_id: str, social_group: str, start_date: str, end_da
         traceback.print_exc(file=sys.stderr)
         _set_progress(task_id, stage=f"Error: {repr(e)}", eta_seconds=0)
 
-### Pydantic model
+# run a coroutine in a new loop
+def run_coro_in_new_loop(coro, overall_timeout: int):
+    result_box: Dict[str, Any] = {}
+    error_box: Dict[str, Exception] = {}
+    done_evt = threading.Event()
 
-class IssueReport(BaseModel):
-    email: EmailStr
-    description: str
+    def _runner():
+        try:
+            result_box["value"] = asyncio.run(asyncio.wait_for(coro, timeout=overall_timeout))
+        except Exception as e:
+            error_box["exc"] = e
+        finally:
+            done_evt.set()
 
-### FastAPI app + middleware
+    t = threading.Thread(target=_runner, daemon=True)
+    t.start()
+    if not done_evt.wait(overall_timeout + 5):
+        raise TimeoutError("Timed out waiting for async operation to finish")
 
-app = FastAPI()
+    if "exc" in error_box:
+        raise error_box["exc"]
+    return result_box.get("value")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS or ["http://localhost:3000"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-### Routes / endpoints
-
-# status message
+# Return status
 @app.get("/")
 def home():
     return {"message": "FastAPI is running"}
 
-# download endpoint for generated zip
+# download button
 @app.get("/download/{task_id}")
 async def download_result(task_id: str):
     path = task_result_paths.get(task_id)
@@ -1191,11 +1208,10 @@ async def get_dataset_stats():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get dataset stats: {str(e)}")
 
-### Startup / shutdown hooks and __main__
-
 # make sure old temp files are cleared on start-up
 cleanup_old_temp_files()
 
 # run the app
 if __name__ == "__main__":
+    
     uvicorn.run(app, host="0.0.0.0", port=8000)
