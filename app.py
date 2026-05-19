@@ -1,14 +1,18 @@
 # package and function imports
 from __future__ import annotations
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, EmailStr
 
+import json
 import os
 import sys
 import uuid
+import hmac
+import base64
+import hashlib
 import tarfile
 import io
 import csv
@@ -19,6 +23,8 @@ import gzip
 import shutil
 import traceback
 import gc
+import urllib.error
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple, Callable, Any, Iterable
@@ -61,6 +67,16 @@ SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 ISSUE_RECEIVER_EMAIL = os.getenv("ISSUE_RECEIVER_EMAIL", SMTP_USER)
+
+# Supabase authentication
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+SUPABASE_AUTH_TIMEOUT_SECONDS = float(os.getenv("SUPABASE_AUTH_TIMEOUT_SECONDS", "10"))
+
+# Download link signing
+PUBLIC_BACKEND_URL = os.getenv("PUBLIC_BACKEND_URL", "https://isaac.psychology.illinois.edu").rstrip("/")
+DOWNLOAD_URL_SECRET = os.getenv("DOWNLOAD_URL_SECRET", "")
+DOWNLOAD_LINK_TTL_SECONDS = int(os.getenv("DOWNLOAD_LINK_TTL_SECONDS", "86400"))
 
 # Performance / sizing
 ARCHIVE_PART_SIZE_ROWS = int(os.getenv("ARCHIVE_PART_SIZE_ROWS", os.getenv("ZIP_PART_SIZE_ROWS", "100000")))
@@ -354,13 +370,16 @@ def _reset_eta_smoothing(task_id: str) -> None:
 def _init_progress_meta(task_id: str, total_units: int, stage: str) -> None:
     ts = now()
     with _progress_lock:
-        task_meta[task_id] = {
-            "start_time": ts,
-            "phase_start_ts": ts,
-            "phase_start_units": 0,
-            "total_units": max(0, int(total_units)),
-            "completed_units": 0,
-        }
+        meta = task_meta.setdefault(task_id, {})
+        meta.setdefault("start_time", ts)
+        meta.update(
+            {
+                "phase_start_ts": ts,
+                "phase_start_units": 0,
+                "total_units": max(0, int(total_units)),
+                "completed_units": 0,
+            }
+        )
         task_progress[task_id] = {"percent": 0.0, "eta_seconds": None, "eta_human": None}
         task_stage[task_id] = stage
 
@@ -1063,6 +1082,7 @@ def merge_sampled_to_chunks(
 
 def background_sampling(task_id: str, social_group: str, start_date: str, end_date: str, num_docs: Optional[int] = None):
     try:
+        _update_task_meta(task_id, status="processing")
         overall_timeout = int(os.getenv("DB_OVERALL_TIMEOUT", "300"))
         _set_progress(task_id, stage="Fetching metadata")
 
@@ -1077,17 +1097,24 @@ def background_sampling(task_id: str, social_group: str, start_date: str, end_da
                 overall_timeout=overall_timeout,
             )
         except Exception as e:
-            _set_progress(task_id, stage=f"Error: fetch_metadata failed: {repr(e)}", eta_seconds=0)
+            reason = f"fetch_metadata failed: {repr(e)}"
+            _update_task_meta(task_id, status="failed", failure_reason=reason)
+            _set_progress(task_id, stage=f"Error: {reason}", eta_seconds=0)
+            _notify_request_failed(task_id, social_group, start_date, end_date, num_docs, reason)
             return
 
         if not files:
+            _update_task_meta(task_id, status="failed", failure_reason="No files found")
             _set_progress(task_id, stage="No files found", eta_seconds=0)
+            _notify_request_failed(task_id, social_group, start_date, end_date, num_docs, "No files found")
             return
 
         # ---- Full-range path: tar of original .csv.gz files (with parquet converted) ----
         if num_docs is None:
             tar_originals_from_local(task_id, files, social_group, start_date, end_date)
+            _update_task_meta(task_id, status="completed")
             _set_progress(task_id, stage="Done", eta_seconds=0)
+            _notify_download_ready(task_id, social_group, start_date, end_date, num_docs)
             return
 
         # ---- Random-subset path: per-file sampling + merge into chunked .csv.gz + tar ----
@@ -1168,7 +1195,9 @@ def background_sampling(task_id: str, social_group: str, start_date: str, end_da
                 pass
             task_result_paths[task_id] = tar_path
             task_results[task_id] = f"/download/{task_id}"
+            _update_task_meta(task_id, status="completed")
             _set_progress(task_id, completed_units=total_units, stage="No matching rows found", eta_seconds=0)
+            _notify_download_ready(task_id, social_group, start_date, end_date, num_docs)
             cleanup_old_tasks()
             return
 
@@ -1226,18 +1255,24 @@ def background_sampling(task_id: str, social_group: str, start_date: str, end_da
             raise
 
         if not os.path.exists(tar_path):
+            _update_task_meta(task_id, status="failed", failure_reason="No output generated")
             _set_progress(task_id, stage="Error: No output generated", eta_seconds=0)
+            _notify_request_failed(task_id, social_group, start_date, end_date, num_docs, "No output generated")
             return
 
         task_result_paths[task_id] = tar_path
         task_results[task_id] = f"/download/{task_id}"
+        _update_task_meta(task_id, status="completed")
         _set_progress(task_id, completed_units=total_units, stage="Done", eta_seconds=0)
+        _notify_download_ready(task_id, social_group, start_date, end_date, num_docs)
         cleanup_old_tasks()
 
     except Exception as e:
         print(f"[ERROR] background_sampling crashed: {repr(e)}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
+        _update_task_meta(task_id, status="failed", failure_reason=repr(e))
         _set_progress(task_id, stage=f"Error: {repr(e)}", eta_seconds=0)
+        _notify_request_failed(task_id, social_group, start_date, end_date, num_docs, repr(e))
 
 # run a coroutine in a new loop
 def run_coro_in_new_loop(coro, overall_timeout: int):
@@ -1276,9 +1311,177 @@ def _user_facing_filename(disk_name: str) -> str:
     name = re.sub(r"_[0-9a-fA-F]{8}(?=\.[^.]+$)", "", name)
     return name
 
+def _download_signature_payload(task_id: str, expires: int) -> bytes:
+    return f"{task_id}:{int(expires)}".encode("utf-8")
+
+def _sign_download_url(task_id: str, expires: int) -> str:
+    if not DOWNLOAD_URL_SECRET:
+        raise RuntimeError("DOWNLOAD_URL_SECRET is not configured")
+
+    digest = hmac.new(
+        DOWNLOAD_URL_SECRET.encode("utf-8"),
+        _download_signature_payload(task_id, expires),
+        hashlib.sha256,
+    ).digest()
+    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+def _generate_signed_download_url(task_id: str) -> str:
+    expires = int(now()) + max(1, DOWNLOAD_LINK_TTL_SECONDS)
+    token = _sign_download_url(task_id, expires)
+    return f"{PUBLIC_BACKEND_URL}/download/{task_id}?expires={expires}&token={token}"
+
+def _verify_download_signature(task_id: str, expires: int, token: str) -> bool:
+    if not token:
+        return False
+    expected = _sign_download_url(task_id, expires)
+    return hmac.compare_digest(expected, token)
+
+def _update_task_meta(task_id: str, **fields: Any) -> None:
+    with _progress_lock:
+        meta = task_meta.setdefault(task_id, {"start_time": now()})
+        meta.update(fields)
+
+def _extract_bearer_token(authorization: Optional[str]) -> str:
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing authorization token")
+
+    scheme, separator, token = authorization.partition(" ")
+    if not separator or scheme.lower() != "bearer" or not token.strip():
+        raise HTTPException(status_code=401, detail="Invalid authorization header")
+    return token.strip()
+
+def _get_supabase_user_email(authorization: Optional[str]) -> str:
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise HTTPException(status_code=500, detail="Supabase authentication configuration missing")
+
+    token = _extract_bearer_token(authorization)
+    request = urllib.request.Request(
+        f"{SUPABASE_URL}/auth/v1/user",
+        headers={
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {token}",
+        },
+        method="GET",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=SUPABASE_AUTH_TIMEOUT_SECONDS) as response:
+            raw_body = response.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            raise HTTPException(status_code=401, detail="Invalid or expired session token")
+        raise HTTPException(status_code=502, detail=f"Supabase authentication failed: HTTP {e.code}")
+    except urllib.error.URLError as e:
+        raise HTTPException(status_code=502, detail=f"Supabase authentication unavailable: {e.reason}")
+
+    try:
+        user = json.loads(raw_body)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=502, detail="Supabase authentication returned invalid data")
+
+    email = (user.get("email") or "").strip()
+    if not email:
+        raise HTTPException(status_code=401, detail="Authenticated user has no email")
+    return email
+
+async def _send_email(to_email: str, subject: str, body: str) -> None:
+    if not SMTP_HOST or not SMTP_USER or not SMTP_PASSWORD:
+        raise RuntimeError("SMTP configuration missing")
+
+    message = EmailMessage()
+    message["From"] = SMTP_USER
+    message["To"] = to_email
+    message["Subject"] = subject
+    message.set_content(body)
+
+    await aiosmtplib.send(
+        message,
+        hostname=SMTP_HOST,
+        port=SMTP_PORT,
+        start_tls=True,
+        username=SMTP_USER,
+        password=SMTP_PASSWORD,
+    )
+
+def _send_email_sync(to_email: str, subject: str, body: str) -> None:
+    timeout = int(os.getenv("EMAIL_SEND_TIMEOUT_SECONDS", "30"))
+    run_coro_in_new_loop(_send_email(to_email, subject, body), overall_timeout=timeout)
+
+def _request_summary(social_group: str, start_date: str, end_date: str, num_docs: Optional[int]) -> str:
+    sample_size = "all matching documents" if num_docs is None else f"{num_docs} documents"
+    return f"Social group: {social_group}\nDate range: {start_date} to {end_date}\nRequested sample: {sample_size}"
+
+def _notify_download_ready(task_id: str, social_group: str, start_date: str, end_date: str, num_docs: Optional[int]) -> None:
+    email = str((task_meta.get(task_id) or {}).get("email") or "").strip()
+    if not email:
+        _update_task_meta(task_id, email_status="skipped")
+        return
+
+    _update_task_meta(task_id, email_status="sending")
+    try:
+        download_url = _generate_signed_download_url(task_id)
+        _send_email_sync(
+            email,
+            "Your ISAAC sample is ready",
+            (
+                "Your ISAAC sample is ready for download.\n\n"
+                f"{_request_summary(social_group, start_date, end_date, num_docs)}\n\n"
+                f"Download link:\n{download_url}\n\n"
+                f"This link expires in {max(1, DOWNLOAD_LINK_TTL_SECONDS) // 3600 or 1} hour(s)."
+            ),
+        )
+        _update_task_meta(task_id, email_status="sent")
+    except Exception as e:
+        print(f"[ERROR] Failed to send download email for {task_id}: {e}", file=sys.stderr)
+        _update_task_meta(task_id, email_status="failed", email_error=str(e))
+
+def _notify_request_failed(
+    task_id: str,
+    social_group: str,
+    start_date: str,
+    end_date: str,
+    num_docs: Optional[int],
+    reason: str,
+) -> None:
+    email = str((task_meta.get(task_id) or {}).get("email") or "").strip()
+    if not email:
+        _update_task_meta(task_id, email_status="skipped")
+        return
+
+    _update_task_meta(task_id, email_status="sending")
+    try:
+        _send_email_sync(
+            email,
+            "Your ISAAC sample could not be completed",
+            (
+                "We could not complete your ISAAC sample request.\n\n"
+                f"{_request_summary(social_group, start_date, end_date, num_docs)}\n\n"
+                f"Reason: {reason}\n\n"
+                "Please try again later or report the issue if it continues."
+            ),
+        )
+        _update_task_meta(task_id, email_status="sent")
+    except Exception as e:
+        print(f"[ERROR] Failed to send failure email for {task_id}: {e}", file=sys.stderr)
+        _update_task_meta(task_id, email_status="failed", email_error=str(e))
+
 # download button
 @app.get("/download/{task_id}")
-async def download_result(task_id: str):
+async def download_result(task_id: str, expires: Optional[int] = None, token: Optional[str] = None):
+    if expires is None or not token:
+        raise HTTPException(status_code=403, detail="Missing download signature")
+
+    try:
+        is_valid_signature = _verify_download_signature(task_id, expires, token)
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    if not is_valid_signature:
+        raise HTTPException(status_code=403, detail="Invalid download signature")
+
+    if int(now()) > int(expires):
+        raise HTTPException(status_code=410, detail="Download link has expired")
+
     path = task_result_paths.get(task_id)
 
     # Look up the result file for this task. New tasks produce .tar with a short-id
@@ -1313,23 +1516,14 @@ async def download_result(task_id: str):
 # report issue function
 @app.post("/report_issue")
 async def report_issue(data: IssueReport):
-    if not SMTP_HOST or not SMTP_USER or not SMTP_PASSWORD or not ISSUE_RECEIVER_EMAIL:
+    if not ISSUE_RECEIVER_EMAIL:
         raise HTTPException(status_code=500, detail="SMTP configuration missing")
 
-    message = EmailMessage()
-    message["From"] = SMTP_USER
-    message["To"] = ISSUE_RECEIVER_EMAIL
-    message["Subject"] = f"Issue Reported by {data.email}"
-    message.set_content(f"User Email: {data.email}\n\nIssue:\n{data.description}")
-
     try:
-        await aiosmtplib.send(
-            message,
-            hostname=SMTP_HOST,
-            port=SMTP_PORT,
-            start_tls=True,
-            username=SMTP_USER,
-            password=SMTP_PASSWORD,
+        await _send_email(
+            ISSUE_RECEIVER_EMAIL,
+            f"Issue Reported by {data.email}",
+            f"User Email: {data.email}\n\nIssue:\n{data.description}",
         )
         return {"message": "Issue reported successfully"}
     except Exception as e:
@@ -1337,7 +1531,12 @@ async def report_issue(data: IssueReport):
 
 # sampling task
 @app.post("/sample")
-async def get_sampled_data(payload: dict, background_tasks: BackgroundTasks):
+async def get_sampled_data(
+    payload: dict,
+    background_tasks: BackgroundTasks,
+    authorization: Optional[str] = Header(default=None),
+):
+    user_email = await asyncio.to_thread(_get_supabase_user_email, authorization)
     social_group = payload.get("social_group")
     start_date = payload.get("start_date")
     end_date = payload.get("end_date")
@@ -1377,23 +1576,40 @@ async def get_sampled_data(payload: dict, background_tasks: BackgroundTasks):
 
     task_id = str(uuid.uuid4())
     with _progress_lock:
-        task_meta[task_id] = {"start_time": now(), "total_units": 0, "completed_units": 0}
+        task_meta[task_id] = {
+            "start_time": now(),
+            "total_units": 0,
+            "completed_units": 0,
+            "email": user_email,
+            "status": "queued",
+            "email_status": "pending",
+            "social_group": social_group,
+            "start_date": start_date,
+            "end_date": end_date,
+            "num_docs": num_docs,
+        }
         task_progress[task_id] = {"percent": 0.0, "eta_seconds": None, "eta_human": None}
         task_stage[task_id] = "Queued"
 
     background_tasks.add_task(background_sampling, task_id, social_group, start_date, end_date, num_docs)
-    return {"task_id": task_id}
+    return {
+        "task_id": task_id,
+        "message": "Your file is being prepared. We will email the download link when it is ready.",
+    }
 
 # progress marker
 @app.get("/progress/{task_id}")
 async def get_progress(task_id: str):
     prog = task_progress.get(task_id, {})
+    meta = task_meta.get(task_id, {})
     return {
         "stage": task_stage.get(task_id, "Initializing..."),
         "percent": prog.get("percent"),
         "eta_seconds": prog.get("eta_seconds"),
         "eta_human": prog.get("eta_human"),
         "download_link": task_results.get(task_id),
+        "status": meta.get("status"),
+        "email_status": meta.get("email_status"),
     }
 
 # dataset stats evaluation
