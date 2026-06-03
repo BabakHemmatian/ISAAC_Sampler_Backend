@@ -1,0 +1,3 @@
+# Keep shell and Python scripts LF so they run on the Linux VM
+*.sh text eol=lf
+*.py text eol=lf

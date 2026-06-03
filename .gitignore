@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Runtime artifacts
+temp_files/
+*.log
