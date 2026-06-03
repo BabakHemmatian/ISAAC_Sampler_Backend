@@ -23,7 +23,7 @@ SUPABASE_S3_SECRET_ACCESS_KEY = os.getenv("SUPABASE_S3_SECRET_ACCESS_KEY")
 SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET_NAME")
 
 # Initialize Supabase client and S3 client
-supabase: Client = create_client(SUPABASE_URL, "***REMOVED***")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 s3_client = boto3.client(
     "s3",
