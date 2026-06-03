@@ -467,13 +467,19 @@ def estimate_num_rows_local(path: Path) -> int:
         return 0
 
 # sort sample positions
-def _build_sorted_sample_positions(total_rows: int, k: int) -> np.ndarray:
+def _build_sorted_sample_positions(
+    total_rows: int,
+    k: int,
+    seed: Optional[Any] = None,
+) -> np.ndarray:
     if total_rows <= 0 or k <= 0:
         return np.empty(0, dtype=np.int64)
     k = min(int(k), int(total_rows))
     if k == total_rows:
         return np.arange(total_rows, dtype=np.int64)
-    rng = np.random.default_rng()
+    # If a seed (int or numpy SeedSequence) is provided the RNG is fully
+    # deterministic, which is what makes the random subset reproducible.
+    rng = np.random.default_rng(seed)
     return np.sort(rng.choice(total_rows, size=k, replace=False).astype(np.int64, copy=False))
 
 ### PyArrow CSV helpers
@@ -667,6 +673,7 @@ def sample_any_to_temp_csv(
     k: int,
     *,
     progress_cb: Optional[Callable[[int], None]] = None,
+    seed: Optional[Any] = None,
 ) -> Tuple[Optional[str], int, str]:
     if k <= 0:
         return None, 0, ""
@@ -676,7 +683,7 @@ def sample_any_to_temp_csv(
         return None, 0, ""
 
     source_path = choose_sampling_path(file_info, k)
-    positions = _build_sorted_sample_positions(num_rows, min(k, num_rows))
+    positions = _build_sorted_sample_positions(num_rows, min(k, num_rows), seed=seed)
     if positions.size == 0:
         return None, 0, source_path
 
@@ -1061,7 +1068,14 @@ def merge_sampled_to_chunks(
 
 ### Sampling task
 
-def background_sampling(task_id: str, social_group: str, start_date: str, end_date: str, num_docs: Optional[int] = None):
+def background_sampling(
+    task_id: str,
+    social_group: str,
+    start_date: str,
+    end_date: str,
+    num_docs: Optional[int] = None,
+    random_seed: Optional[int] = None,
+):
     try:
         overall_timeout = int(os.getenv("DB_OVERALL_TIMEOUT", "300"))
         _set_progress(task_id, stage="Fetching metadata")
@@ -1095,6 +1109,16 @@ def background_sampling(task_id: str, social_group: str, start_date: str, end_da
         num_docs = max(0, min(int(num_docs), total_available))
         quotas = compute_per_file_quotas(files, num_docs)
 
+        # When a seed is supplied, derive a deterministic per-file child seed via
+        # numpy's SeedSequence. This guarantees reproducibility regardless of the
+        # order in which ThreadPoolExecutor workers finish each file, while still
+        # giving each file a statistically independent stream.
+        if random_seed is not None:
+            seed_sequence = np.random.SeedSequence(int(random_seed))
+            file_seeds: List[Optional[Any]] = list(seed_sequence.spawn(len(files)))
+        else:
+            file_seeds = [None] * len(files)
+
         # All three phases use rows as the unit so phase rates stay comparable and
         # ETA resets between phases produce sensible values.
         # - Sampling phase: rows scanned across source files (compute_sampling_total_units).
@@ -1107,8 +1131,11 @@ def background_sampling(task_id: str, social_group: str, start_date: str, end_da
         _init_progress_meta(task_id, total_units=total_units, stage="Sampling documents")
 
         short_id = task_id.replace("-", "")[:8]
-        tar_filename = f"ISSAC_{social_group}_{start_date}_{end_date}_{short_id}.tar"
-        display_filename = f"ISSAC_{social_group}_{start_date}_{end_date}.tar"
+        # When a seed was supplied, embed it in both the on-disk and user-facing
+        # filenames so reproducible subsets are self-describing.
+        seed_suffix = f"_seed{int(random_seed)}" if random_seed is not None else ""
+        tar_filename = f"ISSAC_{social_group}_{start_date}_{end_date}{seed_suffix}_{short_id}.tar"
+        display_filename = f"ISSAC_{social_group}_{start_date}_{end_date}{seed_suffix}.tar"
         tar_path = str(TEMP_DIR / tar_filename)
         with _progress_lock:
             if task_id in task_meta:
@@ -1147,15 +1174,24 @@ def background_sampling(task_id: str, social_group: str, start_date: str, end_da
             if leftover > 0:
                 _increment_progress(task_id, leftover, stage="Sampling documents")
 
-        def process_one(file_info: Dict[str, Any], k: int) -> Tuple[Optional[str], int, str]:
+        def process_one(file_info: Dict[str, Any], k: int, file_seed: Optional[Any]) -> Tuple[Optional[str], int, str]:
             file_key = file_info["file_path"]
             try:
-                return sample_any_to_temp_csv(file_info, k, progress_cb=make_progress_cb(file_key))
+                return sample_any_to_temp_csv(
+                    file_info,
+                    k,
+                    progress_cb=make_progress_cb(file_key),
+                    seed=file_seed,
+                )
             finally:
                 flush_file_progress(file_key)
 
         with ThreadPoolExecutor(max_workers=DEFAULT_MAX_WORKERS) as ex:
-            futures = [ex.submit(process_one, f, q) for f, q in zip(files, quotas) if q > 0]
+            futures = [
+                ex.submit(process_one, f, q, s)
+                for f, q, s in zip(files, quotas, file_seeds)
+                if q > 0
+            ]
             for fut in as_completed(futures):
                 tmp_csv_path, row_count, used_path = fut.result()
                 if tmp_csv_path and row_count > 0:
@@ -1342,6 +1378,7 @@ async def get_sampled_data(payload: dict, background_tasks: BackgroundTasks):
     start_date = payload.get("start_date")
     end_date = payload.get("end_date")
     num_docs = payload.get("num_docs")
+    random_seed = payload.get("random_seed")
 
     if not social_group or not start_date or not end_date:
         raise HTTPException(status_code=400, detail="Missing required fields")
@@ -1372,6 +1409,22 @@ async def get_sampled_data(payload: dict, background_tasks: BackgroundTasks):
         except (ValueError, TypeError):
             raise HTTPException(status_code=400, detail="num_docs must be a valid integer")
 
+    # The seed is only meaningful when a sample size is requested. Silently drop
+    # it for the full-range path so the user-facing tar filename stays clean.
+    if random_seed is not None and num_docs is not None:
+        try:
+            random_seed = int(random_seed)
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="random_seed must be a valid integer")
+        if random_seed < 0:
+            raise HTTPException(status_code=400, detail="random_seed must be non-negative")
+        # numpy's SeedSequence accepts arbitrarily large ints, but cap to a
+        # 64-bit range so we don't silently overflow downstream JSON or filenames.
+        if random_seed > 2**63 - 1:
+            raise HTTPException(status_code=400, detail="random_seed exceeds maximum allowed (2^63 - 1)")
+    else:
+        random_seed = None
+
     cleanup_old_tasks()
     cleanup_old_temp_files()
 
@@ -1381,7 +1434,15 @@ async def get_sampled_data(payload: dict, background_tasks: BackgroundTasks):
         task_progress[task_id] = {"percent": 0.0, "eta_seconds": None, "eta_human": None}
         task_stage[task_id] = "Queued"
 
-    background_tasks.add_task(background_sampling, task_id, social_group, start_date, end_date, num_docs)
+    background_tasks.add_task(
+        background_sampling,
+        task_id,
+        social_group,
+        start_date,
+        end_date,
+        num_docs,
+        random_seed,
+    )
     return {"task_id": task_id}
 
 # progress marker
