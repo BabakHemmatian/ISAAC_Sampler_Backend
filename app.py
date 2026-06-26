@@ -9,7 +9,6 @@ from pydantic import BaseModel, EmailStr
 import os
 import sys
 import uuid
-import tarfile
 import io
 import csv
 import time
@@ -63,7 +62,6 @@ SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 ISSUE_RECEIVER_EMAIL = os.getenv("ISSUE_RECEIVER_EMAIL", SMTP_USER)
 
 # Performance / sizing
-ARCHIVE_PART_SIZE_ROWS = int(os.getenv("ARCHIVE_PART_SIZE_ROWS", os.getenv("ZIP_PART_SIZE_ROWS", "100000")))
 DEFAULT_MAX_WORKERS = int(os.getenv("MAX_WORKERS", str(max(2, os.cpu_count() or 4))))
 ETA_EMA_ALPHA = float(os.getenv("ETA_EMA_ALPHA", "0.25"))
 GZIP_COMPRESSLEVEL = int(os.getenv("GZIP_COMPRESSLEVEL", "1"))  # for parquet -> csv.gz and merged chunks
@@ -773,260 +771,28 @@ def compute_sampling_total_units(files: List[Dict[str, Any]], quotas: List[int])
             total += num_rows
     return max(total, 1)
 
-### Tar bundling for the full-range path
-
-# Strip identifying/host metadata from tar headers so the archive is reproducible.
-def _tar_filter(tarinfo: tarfile.TarInfo) -> tarfile.TarInfo:
-    tarinfo.uid = 0
-    tarinfo.gid = 0
-    tarinfo.uname = ""
-    tarinfo.gname = ""
-    tarinfo.mode = 0o644
-    return tarinfo
-
-# Estimated relative work for the prepare phase, in "row-equivalent" units.
-# Both .csv.gz and plain .csv are streamed verbatim into the tar, so their prep
-# cost is essentially zero. Parquet is the only format that needs real work
-# (decompress + CSV-format + gzip), proportional to row count. Keeping these
-# proportional to row count means the rate calculation stays stable when months
-# differ in size.
-def _prepare_weight(file_info: Dict[str, Any]) -> int:
-    primary = file_info.get("file_path") or ""
-    csv_path = file_info.get("csv_file_path") or ""
-    has_csv = bool(file_info.get("csv_available") and csv_path)
-    key = csv_path if has_csv else primary
-    lower = key.lower() if isinstance(key, str) else ""
-    rows = max(1, int(file_info.get("num_rows") or 1))
-    if lower.endswith((".parquet", ".parq")):
-        return rows
-    # .csv.gz, .csv, or unknown -- byte-copy in the bundle phase, near-zero prep work.
-    return 1
-
-# Estimated relative work for the bundle phase (tar.add). The bundle phase is now
-# the main I/O path for .csv inputs, so weight scales with row count. .csv.gz and
-# parquet-derived .csv.gz members are smaller (compressed) so cost per row is lower.
-def _bundle_weight(file_info: Dict[str, Any]) -> int:
-    primary = file_info.get("file_path") or ""
-    csv_path = file_info.get("csv_file_path") or ""
-    has_csv = bool(file_info.get("csv_available") and csv_path)
-    key = csv_path if has_csv else primary
-    lower = key.lower() if isinstance(key, str) else ""
-    rows = max(1, int(file_info.get("num_rows") or 1))
-    if lower.endswith(".csv"):
-        return rows  # full uncompressed bytes go through the tar writer
-    return max(1, rows // 4)  # compressed members: smaller payload
-
-# Convert a parquet file to a gzipped CSV at dst_path using PyArrow's CSV writer.
-# This replaces the old pandas df.to_csv() per row group, which was the dominant
-# CPU cost for parquet-only months.
-def _parquet_to_csv_gz(src_path: str, dst_path: str, columns: Optional[List[str]] = None) -> None:
-    pf = pq.ParquetFile(src_path)
-    md = pf.metadata
-    num_row_groups = md.num_row_groups if md else 0
-
-    with gzip.open(dst_path, "wb", compresslevel=GZIP_COMPRESSLEVEL) as gz:
-        if num_row_groups == 0:
-            table = pf.read(columns=columns)
-            if table.num_rows > 0:
-                pacsv.write_csv(table, gz)
-            return
-
-        writer: Optional[pacsv.CSVWriter] = None
-        try:
-            for i in range(num_row_groups):
-                table = pf.read_row_group(i, columns=columns)
-                if table.num_rows == 0:
-                    continue
-                if writer is None:
-                    writer = pacsv.CSVWriter(gz, table.schema)
-                writer.write_table(table)
-        finally:
-            if writer is not None:
-                writer.close()
-
-# Stage one source file for tar bundling. Returns (arcname_in_tar, source_path, is_temp).
-#   .csv.gz  -> stream verbatim (no copy, no recompression). is_temp=False.
-#   .csv     -> stream verbatim (no compression, no temp file). is_temp=False.
-#               Skipping per-file gzip here is by design: when the source is plain
-#               .csv, gzipping into a temp .csv.gz before tar.add forces a full
-#               read+write+read+write I/O cycle through a temp file, which on
-#               typical disks is the bottleneck. Streaming the plain .csv straight
-#               into the tar halves the I/O at the cost of a larger output.
-#   .parquet -> convert to a temp .csv.gz via PyArrow (we have to convert anyway,
-#               and gzipping during conversion is essentially free since we're
-#               already touching every byte once).
-# This is the function that runs in parallel during the prepare phase.
-def _prepare_for_tar(file_info: Dict[str, Any]) -> Tuple[str, str, bool]:
-    primary_key = file_info["file_path"]
-    csv_key = file_info.get("csv_file_path") or ""
-    has_csv = bool(file_info.get("csv_available") and csv_key and os.path.exists(csv_key))
-    key = csv_key if has_csv else primary_key
-    lower = key.lower()
-    base = os.path.basename(key)
-
-    if lower.endswith(".csv.gz"):
-        return base, key, False
-
-    if lower.endswith((".parquet", ".parq")):
-        if lower.endswith(".parquet"):
-            arcname = base[: -len(".parquet")] + ".csv.gz"
-        else:
-            arcname = base[: -len(".parq")] + ".csv.gz"
-        tmp_path = str(TEMP_DIR / f"prep_{uuid.uuid4().hex}.csv.gz")
-        _parquet_to_csv_gz(key, tmp_path, columns=READ_COLUMNS)
-        return arcname, tmp_path, True
-
-    if lower.endswith(".csv"):
-        # Stream verbatim. The tar member is plain .csv -- users gunzip the .csv.gz
-        # members and read the .csv ones directly.
-        return base, key, False
-
-    # Unknown extension -- copy verbatim and let the user figure it out.
-    return base, key, False
-
-# Bundle full-range files into an uncompressed .tar containing .csv.gz members.
-#
-# Two-stage pipeline:
-#   Phase 1 (parallel): _prepare_for_tar() per file. .csv.gz is a no-op; parquet is
-#     converted via PyArrow CSV; plain .csv is gzipped. All workers run independently.
-#   Phase 2 (serial):   one thread tars all prepared blobs. tar.add() is a cheap byte
-#     copy with no data hashing (unlike zip's mandatory CRC32).
-#
-# This replaces the old zip pipeline which (a) decompressed every .csv.gz, (b) re-
-# DEFLATEd it into the zip, and (c) serialized everything behind a global zip_lock,
-# defeating the ThreadPoolExecutor.
-def tar_originals_from_local(task_id: str, files: List[Dict[str, Any]], social_group: str, start_date: str, end_date: str) -> str:
-    # On-disk filename keeps a short task-id slug for collision avoidance among
-    # concurrent jobs. The browser-facing filename (set by /download) drops it.
-    short_id = task_id.replace("-", "")[:8]
-    tar_filename = f"ISSAC_{social_group}_{start_date}_{end_date}_{short_id}.tar"
-    display_filename = f"ISSAC_{social_group}_{start_date}_{end_date}.tar"
-    tar_path = str(TEMP_DIR / tar_filename)
-
-    # Weighted units: parquet conversions and bundle byte-copies have very different
-    # per-file costs. Uniform per-file units made the EMA estimator misbehave because
-    # bursts of cheap .csv.gz "completions" inflated the early rate.
-    prepare_weights = [_prepare_weight(f) for f in files]
-    bundle_weights = [_bundle_weight(f) for f in files]
-    total_prepare = max(1, sum(prepare_weights))
-    total_bundle = max(1, sum(bundle_weights))
-    total_units = total_prepare + total_bundle
-    _init_progress_meta(task_id, total_units=total_units, stage="Preparing files")
-    with _progress_lock:
-        if task_id in task_meta:
-            task_meta[task_id]["display_filename"] = display_filename
-
-    prepared: List[Tuple[str, str, bool, int]] = []  # (arcname, src, is_temp, idx)
-    prepared_lock = threading.Lock()
-
-    def prepare_one(idx: int, file_info: Dict[str, Any]) -> None:
-        try:
-            arcname, source_path, is_temp = _prepare_for_tar(file_info)
-            with prepared_lock:
-                prepared.append((arcname, source_path, is_temp, idx))
-        except Exception as e:
-            print(f"[ERROR] prepare_for_tar failed for {file_info.get('file_path')}: {e}", file=sys.stderr)
-            traceback.print_exc(file=sys.stderr)
-        finally:
-            _increment_progress(task_id, prepare_weights[idx], stage="Preparing files")
-
-    with ThreadPoolExecutor(max_workers=DEFAULT_MAX_WORKERS) as executor:
-        futures = [executor.submit(prepare_one, i, f) for i, f in enumerate(files)]
-        for fut in as_completed(futures):
-            try:
-                fut.result()
-            except Exception as e:
-                print(f"[ERROR] prepare future failed: {e}", file=sys.stderr)
-                traceback.print_exc(file=sys.stderr)
-
-    # Reset the rate baseline so the bundle phase computes its own throughput.
-    # tar.add() is much faster than parquet conversion, and inheriting the slow
-    # prepare-phase rate would make the ETA stick high and then drop sharply.
-    _reset_eta_smoothing(task_id)
-    _set_progress(task_id, stage="Bundling files into archive")
-
-    try:
-        # Sort by arcname so the archive ordering is deterministic regardless of
-        # which prepare worker finished first.
-        prepared.sort(key=lambda x: x[0])
-        with tarfile.open(tar_path, "w") as tar:
-            for arcname, source_path, _is_temp, idx in prepared:
-                try:
-                    tar.add(source_path, arcname=arcname, recursive=False, filter=_tar_filter)
-                except Exception as e:
-                    print(f"[ERROR] tar.add failed for {source_path}: {e}", file=sys.stderr)
-                    traceback.print_exc(file=sys.stderr)
-                finally:
-                    _increment_progress(task_id, bundle_weights[idx], stage="Bundling files into archive")
-    finally:
-        # Always clean up temp prep files (parquet conversions, gzipped plain CSVs).
-        for _arcname, source_path, is_temp, _idx in prepared:
-            if is_temp:
-                try:
-                    os.remove(source_path)
-                except OSError:
-                    pass
-
-    task_result_paths[task_id] = tar_path
-    task_results[task_id] = f"/download/{task_id}"
-    cleanup_old_tasks()
-    return task_results[task_id]
-
 ### Sampling: merge step
 
-# Merge per-file sampled .csv.gz files into chunked .csv.gz outputs of <= rows_per_chunk
-# rows each. Replaces the old csv.DictReader + csv.DictWriter row-by-row loop, which
-# was a hot Python interpreter path for large samples.
-#
-# We enforce an all-strings schema so writes never fail due to type drift between files
-# (some files may have all-null int columns that PyArrow infers differently).
-def merge_sampled_to_chunks(
+def merge_sampled_to_single_csv(
     sampled_temp_files: List[Tuple[str, int, str]],
-    output_dir: Path,
-    base_name: str,
-    rows_per_chunk: int,
+    output_path: str,
     *,
-    chunk_done_cb: Optional[Callable[[int], None]] = None,
-) -> List[Tuple[str, str, int]]:
-    """Returns a list of (path, arcname, rows_in_chunk). The chunk_done_cb is
-    called with the row count of each finished chunk so callers can drive an
-    accurate row-based progress meter."""
+    rows_done_cb: Optional[Callable[[int], None]] = None,
+) -> int:
+    """Merge all per-file sampled temps into ONE plain (uncompressed) .csv with a
+    single header row, and return the total rows written.
+
+    This keeps a sample's on-disk shape identical to the full-month files served
+    from Globus (a single CSV, same columns) — no tar, no gzip, no chunking — so
+    the output a user gets opens directly in Excel and matches the bulk files."""
     canonical_schema = pa.schema([pa.field(c, pa.string()) for c in READ_COLUMNS])
     convert_options = _csv_string_convert_options()
     read_options = _csv_read_options(use_threads=False)
     parse_options = pacsv.ParseOptions()
 
-    chunks: List[Tuple[str, str, int]] = []
-    chunk_idx = 0
-    current_writer: Optional[pacsv.CSVWriter] = None
-    current_file = None
-    current_path: Optional[str] = None
-    current_rows = 0
-
-    def open_new_chunk() -> None:
-        nonlocal chunk_idx, current_writer, current_file, current_path, current_rows
-        chunk_idx += 1
-        current_path = str(output_dir / f"merged_{chunk_idx}_{uuid.uuid4().hex}.csv.gz")
-        current_file = gzip.open(current_path, "wb", compresslevel=GZIP_COMPRESSLEVEL)
-        current_writer = pacsv.CSVWriter(current_file, canonical_schema)
-        current_rows = 0
-
-    def close_current_chunk() -> None:
-        nonlocal current_writer, current_file, current_path, current_rows
-        if current_writer is None:
-            return
-        current_writer.close()
-        if current_file is not None:
-            current_file.close()
-        rows_done = current_rows
-        chunks.append((current_path, f"{base_name}_{chunk_idx}.csv.gz", rows_done))
-        if chunk_done_cb is not None:
-            chunk_done_cb(rows_done)
-        current_writer = None
-        current_file = None
-        current_path = None
-        current_rows = 0
-
+    total_rows = 0
+    out_file = open(output_path, "wb")
+    writer = pacsv.CSVWriter(out_file, canonical_schema)  # writes the header row
     try:
         for tmp_csv_path, _row_count, _used_path in sampled_temp_files:
             with gzip.open(tmp_csv_path, "rb") as src:
@@ -1034,37 +800,14 @@ def merge_sampled_to_chunks(
                 for batch in reader:
                     if batch.num_rows == 0:
                         continue
-                    if current_writer is None:
-                        open_new_chunk()
-
-                    offset = 0
-                    while offset < batch.num_rows:
-                        remaining = rows_per_chunk - current_rows
-                        if remaining <= 0:
-                            close_current_chunk()
-                            open_new_chunk()
-                            remaining = rows_per_chunk
-                        take = min(remaining, batch.num_rows - offset)
-                        sliced = batch.slice(offset, take)
-                        current_writer.write_batch(sliced)
-                        current_rows += take
-                        offset += take
-
-        close_current_chunk()
-    except Exception:
-        try:
-            close_current_chunk()
-        except Exception:
-            pass
-        # Clean up any partial chunk files we created on error.
-        for path, _arcname, _rows in chunks:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-        raise
-
-    return chunks
+                    writer.write_batch(batch)
+                    total_rows += batch.num_rows
+                    if rows_done_cb is not None:
+                        rows_done_cb(batch.num_rows)
+    finally:
+        writer.close()
+        out_file.close()
+    return total_rows
 
 ### Sampling task
 
@@ -1086,7 +829,7 @@ def background_sampling(
                     social_group,
                     start_date,
                     end_date,
-                    prefer_csv_for_full_range=(num_docs is None),
+                    prefer_csv_for_full_range=False,
                 ),
                 overall_timeout=overall_timeout,
             )
@@ -1098,13 +841,7 @@ def background_sampling(
             _set_progress(task_id, stage="No files found", eta_seconds=0)
             return
 
-        # ---- Full-range path: tar of original .csv.gz files (with parquet converted) ----
-        if num_docs is None:
-            tar_originals_from_local(task_id, files, social_group, start_date, end_date)
-            _set_progress(task_id, stage="Done", eta_seconds=0)
-            return
-
-        # ---- Random-subset path: per-file sampling + merge into chunked .csv.gz + tar ----
+        # ---- Sampling path: per-file random sampling -> one merged plain CSV ----
         total_available = sum((f.get("num_rows") or 0) for f in files)
         num_docs = max(0, min(int(num_docs), total_available))
         quotas = compute_per_file_quotas(files, num_docs)
@@ -1126,17 +863,19 @@ def background_sampling(
         # - Bundle phase: tar.add of each chunk; weight per chunk reflects fast byte copy.
         total_sampling_units = compute_sampling_total_units(files, quotas)
         total_merge_units = max(1, num_docs)
-        total_bundle_units = max(1, num_docs // 4)
-        total_units = total_sampling_units + total_merge_units + total_bundle_units
+        total_units = total_sampling_units + total_merge_units
         _init_progress_meta(task_id, total_units=total_units, stage="Sampling documents")
 
         short_id = task_id.replace("-", "")[:8]
-        # When a seed was supplied, embed it in both the on-disk and user-facing
-        # filenames so reproducible subsets are self-describing.
+        # Self-describing names: social group, month range, sample size, and (when
+        # supplied) the seed — so a downloaded sample's parameters are obvious from
+        # its filename and reproducible subsets are unambiguous. The sample is a
+        # single plain CSV, matching the full-month files served from Globus.
         seed_suffix = f"_seed{int(random_seed)}" if random_seed is not None else ""
-        tar_filename = f"ISSAC_{social_group}_{start_date}_{end_date}{seed_suffix}_{short_id}.tar"
-        display_filename = f"ISSAC_{social_group}_{start_date}_{end_date}{seed_suffix}.tar"
-        tar_path = str(TEMP_DIR / tar_filename)
+        base_name = f"ISAAC_{social_group}_{start_date}_to_{end_date}_n{num_docs}{seed_suffix}"
+        csv_filename = f"{base_name}_{short_id}.csv"
+        display_filename = f"{base_name}.csv"
+        csv_path = str(TEMP_DIR / csv_filename)
         with _progress_lock:
             if task_id in task_meta:
                 task_meta[task_id]["display_filename"] = display_filename
@@ -1200,9 +939,13 @@ def background_sampling(
                     _set_progress(task_id, stage=f"Sampled {total_sampled_rows} rows so far")
 
         if total_sampled_rows == 0:
-            with tarfile.open(tar_path, "w"):
-                pass
-            task_result_paths[task_id] = tar_path
+            # No rows matched the selection — emit an empty CSV (header only) so the
+            # result is still a valid, openable file in the same format as a normal
+            # sample (this previously produced an empty tar).
+            empty_table = pa.table({c: pa.array([], type=pa.string()) for c in READ_COLUMNS})
+            with open(csv_path, "wb") as out:
+                pacsv.write_csv(empty_table, out)
+            task_result_paths[task_id] = csv_path
             task_results[task_id] = f"/download/{task_id}"
             _set_progress(task_id, completed_units=total_units, stage="No matching rows found", eta_seconds=0)
             cleanup_old_tasks()
@@ -1214,18 +957,15 @@ def background_sampling(
         # mix of CSV-scan vs parquet-row-group sampling).
         _reset_eta_smoothing(task_id)
         _set_progress(task_id, stage="Merging sampled rows")
-        base_name = f"ISSAC_{social_group}_{start_date}_{end_date}"
 
-        def chunk_progress_cb(rows_in_chunk: int) -> None:
-            _increment_progress(task_id, max(1, int(rows_in_chunk)), stage="Merging sampled rows")
+        def merge_progress_cb(rows_done: int) -> None:
+            _increment_progress(task_id, max(1, int(rows_done)), stage="Merging sampled rows")
 
         try:
-            chunks = merge_sampled_to_chunks(
+            merge_sampled_to_single_csv(
                 sampled_temp_files,
-                TEMP_DIR,
-                base_name,
-                ARCHIVE_PART_SIZE_ROWS,
-                chunk_done_cb=chunk_progress_cb,
+                csv_path,
+                rows_done_cb=merge_progress_cb,
             )
         finally:
             # Always remove per-file sampling temps.
@@ -1235,37 +975,11 @@ def background_sampling(
                 except OSError:
                     pass
 
-        # Bundle phase rate is much higher than merge -- reset baseline so the
-        # final ETA reflects byte-copy speed, not the merge gzip overhead.
-        _reset_eta_smoothing(task_id)
-        _set_progress(task_id, stage="Bundling sampled rows")
-        try:
-            with tarfile.open(tar_path, "w") as tar:
-                for chunk_path, arcname, chunk_rows in chunks:
-                    try:
-                        tar.add(chunk_path, arcname=arcname, recursive=False, filter=_tar_filter)
-                    finally:
-                        try:
-                            os.remove(chunk_path)
-                        except OSError:
-                            pass
-                        # Bundle weight scaled to rough byte-copy:row ratio so the
-                        # bundle phase total roughly equals total_bundle_units.
-                        _increment_progress(task_id, max(1, chunk_rows // 4), stage="Bundling sampled rows")
-        except Exception:
-            # Best-effort cleanup of any chunks not yet removed.
-            for chunk_path, _arcname, _rows in chunks:
-                try:
-                    os.remove(chunk_path)
-                except OSError:
-                    pass
-            raise
-
-        if not os.path.exists(tar_path):
+        if not os.path.exists(csv_path):
             _set_progress(task_id, stage="Error: No output generated", eta_seconds=0)
             return
 
-        task_result_paths[task_id] = tar_path
+        task_result_paths[task_id] = csv_path
         task_results[task_id] = f"/download/{task_id}"
         _set_progress(task_id, completed_units=total_units, stage="Done", eta_seconds=0)
         cleanup_old_tasks()
@@ -1306,9 +1020,9 @@ def home():
 # Strip the on-disk uniqueness suffix (8-hex short-id, optionally followed by a
 # legacy 14-digit timestamp + UUID) to produce a user-friendly download filename.
 def _user_facing_filename(disk_name: str) -> str:
-    # Legacy: ISSAC_..._<full-uuid>_<14-digit-ts>.<ext>
+    # Legacy: ISAAC_..._<full-uuid>_<14-digit-ts>.<ext>
     name = re.sub(r"_[0-9a-fA-F]{8}-[0-9a-fA-F-]+_\d{14}(?=\.[^.]+$)", "", disk_name)
-    # New: ISSAC_..._<8-hex-short-id>.<ext>
+    # New: ISAAC_..._<8-hex-short-id>.<ext>
     name = re.sub(r"_[0-9a-fA-F]{8}(?=\.[^.]+$)", "", name)
     return name
 
@@ -1322,7 +1036,7 @@ async def download_result(task_id: str):
     if (not path or not os.path.exists(path)) and TEMP_DIR.exists():
         short_id = task_id.replace("-", "")[:8]
         candidates: List[Path] = []
-        for ext in (".tar", ".zip"):
+        for ext in (".csv", ".tar", ".zip"):
             candidates.extend(TEMP_DIR.glob(f"*_{short_id}{ext}"))
             candidates.extend(TEMP_DIR.glob(f"*_{task_id}_*{ext}"))  # legacy
         if candidates:
@@ -1343,7 +1057,13 @@ async def download_result(task_id: str):
     if not display_name:
         display_name = _user_facing_filename(os.path.basename(path))
 
-    media_type = "application/x-tar" if path.lower().endswith(".tar") else "application/zip"
+    lower = path.lower()
+    if lower.endswith(".csv"):
+        media_type = "text/csv"
+    elif lower.endswith(".tar"):
+        media_type = "application/x-tar"
+    else:
+        media_type = "application/zip"
     return FileResponse(path, media_type=media_type, filename=display_name)
 
 # report issue function
@@ -1382,6 +1102,18 @@ async def get_sampled_data(payload: dict, background_tasks: BackgroundTasks):
 
     if not social_group or not start_date or not end_date:
         raise HTTPException(status_code=400, detail="Missing required fields")
+
+    # Whole-file (no-sample) downloads are now served directly from the public
+    # Globus collection via links generated in the website UI — the VM no longer
+    # bundles entire months on demand (that egress is what we moved off Radiant).
+    # Reject a missing/blank num_docs so this path cannot be invoked from the API.
+    if num_docs is None or (isinstance(num_docs, str) and num_docs.strip() == ""):
+        raise HTTPException(
+            status_code=400,
+            detail=("Whole-file downloads are served via direct Globus links, not this "
+                    "endpoint. Provide num_docs to request a random sample, or use the "
+                    "Direct Download page for full monthly files."),
+        )
 
     try:
         start_parts = start_date.split("-")
