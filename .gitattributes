@@ -1,3 +1,9 @@
-# Keep shell and Python scripts LF so they run on the Linux VM
-*.sh text eol=lf
-*.py text eol=lf
+# Normalize line endings: store all text files as LF in the repo, regardless of
+# the checkout platform (scripts must run on the Linux VM). This stops
+# Windows/CRLF working copies from showing every file as "modified".
+* text=auto eol=lf
+
+# Common binary assets — never normalize.
+*.png binary
+*.jpg binary
+*.ico binary
